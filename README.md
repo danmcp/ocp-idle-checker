@@ -28,6 +28,29 @@ Detects if your OpenShift cluster is idle based on CPU, memory, API server activ
 3. **API Server** < 100 req/sec
 4. **Operators** ≥ 7 days old with low activity
 
+### Decision Logic
+
+Each criterion is evaluated independently and can be `IDLE`, `ACTIVE`, or `UNKNOWN`. The cluster is declared **IDLE** when the number of `IDLE` results reaches `floor(total_criteria × 0.80)`.
+
+#### Spike Detection (CPU & Memory)
+Both CPU and memory are checked against **two data points**: a time-windowed Prometheus average and an instant snapshot from `oc adm top nodes`. The windowed average is the primary signal, but the instant value acts as a safety override:
+
+| Windowed average | Instant snapshot | Result |
+|-----------------|-----------------|--------|
+| IDLE            | IDLE            | **IDLE** ✓ |
+| IDLE            | ACTIVE          | **ACTIVE** — spike detected |
+| ACTIVE          | any             | **ACTIVE** |
+| N/A             | IDLE            | **IDLE** ✓ (fallback to instant) |
+| N/A             | ACTIVE          | **ACTIVE** |
+
+This prevents a cluster from being classified as idle during a temporary pause within an otherwise active workload.
+
+#### Conditional Criteria
+Some criteria are **skipped** (not counted in the total) when the required data is unavailable, which affects the 80% threshold denominator:
+
+- **API Server**: skipped if Prometheus/Thanos is unreachable
+- **Operators**: skipped if none of the configured namespaces exist on the cluster
+
 ## Command Line Options
 
 | Option | Description | Default |
@@ -47,6 +70,8 @@ Detects if your OpenShift cluster is idle based on CPU, memory, API server activ
 
 ### Time-Windowed Metrics
 Queries Prometheus to get average CPU/Memory over the last N minutes instead of just current instant values. Helps distinguish between temporary pauses and sustained idle periods.
+
+Both the windowed average **and** the current instant value are collected. If the average looks idle but the instant snapshot shows active usage, the cluster is marked **ACTIVE** — this prevents misclassifying a cluster that is merely between bursts of work. See [Spike Detection](#spike-detection-cpu--memory) above.
 
 ```bash
 # Check if idle for 30 minutes
