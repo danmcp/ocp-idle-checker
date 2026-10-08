@@ -81,24 +81,29 @@ echo "$JSON" | jq -e '
   .spikes.hypothetical_rule_verdict == "ACTIVE" and
   (.spikes.verdict_source | contains("query_range")) and
   .criteria_detail.api_server.window == "10080m" and
-  (.criteria_detail.api_server.by_verb | length) == 6 and
+  (.criteria_detail.api_server.by_verb | length) == 7 and
   .criteria_detail.api_server.by_verb[0].verb == "GET" and
   .criteria_detail.api_server.by_verb[0].req_per_sec == "230" and
   .criteria_detail.api_server.read_req_per_sec == "263" and
-  .criteria_detail.api_server.write_req_per_sec == "8" and
+  .criteria_detail.api_server.write_req_per_sec == "38" and
   .criteria_detail.operators.age_threshold_days == 7 and
   .criteria_detail.operators.event_threshold == 5 and
   (.criteria_detail.operators.namespaces | length) == 3 and
   .criteria_detail.operators.namespaces[0].namespace == "opendatahub" and
   (.criteria_detail.operators.namespaces[0].pods | length) == 3 and
   .criteria_detail.operators.namespaces[0].pods[0].pod == "rhods-operator-controller-manager-abc" and
+  .criteria_detail.operators.namespaces[0].pods[0].restarts == "3" and
   .criteria_detail.operators.namespaces[0].pods[0].age == "14d" and
+  .criteria_detail.operators.namespaces[0].pods[1].age == "13d" and
   .criteria_detail.operators.namespaces[0].pods[2].pod == "odh-model-controller-manager-qqq" and
   .criteria_detail.operators.namespaces[0].pods[2].age == "3d" and
   .criteria_detail.operators.namespaces[0].events_in_tail == 20 and
   .criteria_detail.operators.namespaces[0].matching_events == 2 and
   .na_census.cpu == "ACTIVE" and
   .na_census.memory == "IDLE" and
+  # 16 timings in the fixture scenario (5m recording rule present, so
+  # the probe runs spikes_rule_max and spikes_rule_coverage). Clusters
+  # without the rule run the ratio_1h fallback instead and log 15.
   (.query_timings | length) == 16 and
   ([.query_timings[].label] | index("spikes_query_range")) != null and
   ([.query_timings[].label] | index("spikes_rule_count_ratio_5m")) != null and
@@ -140,7 +145,7 @@ jq -e '
   .status == "ACTIVE" and
   .criteria.api_server.value == "269.4" and
   .debug.spikes.query_range.verdict == "ACTIVE" and
-  .debug.criteria_detail.api_server.write_req_per_sec == "8" and
+  .debug.criteria_detail.api_server.write_req_per_sec == "38" and
   (.debug.query_timings | length) == 16
 ' "$WORKDIR/full-export.json" >/dev/null \
   && echo "PASS: export_json embeds the debug section" \

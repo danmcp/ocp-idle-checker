@@ -5,7 +5,7 @@
 # data replicates build-16 reality: node series carry only the "instance"
 # label (no "node"), one node spikes to 41.7% in a single 15m step, the GPU
 # idles at 0% utilization with 87% VRAM used, and the api-server verb mix
-# is read-heavy (263 reads/s vs 8 writes/s).
+# is read-heavy (263 reads/s vs 38 writes/s, including server-side APPLY).
 urldecode() {
     local s="${1//+/ }"
     printf '%b' "${s//%/\\x}"
@@ -61,7 +61,7 @@ case "$query" in
     'count by (node, instance) (count_over_time(node:node_cpu_utilisation:ratio_5m[10080m]))')
         ok '[{"metric":{"instance":"ip-10-0-5-50.us-east-2.compute.internal:9100"},"value":[1759904500,"2016"]},{"metric":{"instance":"ip-10-0-60-146.us-east-2.compute.internal:9100"},"value":[1759904500,"2015"]}]' ;;
     'sum by (verb) (rate(apiserver_request_total[10080m]))')
-        ok '[{"metric":{"verb":"GET"},"value":[1759904500,"230"]},{"metric":{"verb":"LIST"},"value":[1759904500,"20"]},{"metric":{"verb":"WATCH"},"value":[1759904500,"13"]},{"metric":{"verb":"POST"},"value":[1759904500,"5"]},{"metric":{"verb":"PUT"},"value":[1759904500,"2"]},{"metric":{"verb":"PATCH"},"value":[1759904500,"1"]}]' ;;
+        ok '[{"metric":{"verb":"GET"},"value":[1759904500,"230"]},{"metric":{"verb":"LIST"},"value":[1759904500,"20"]},{"metric":{"verb":"WATCH"},"value":[1759904500,"13"]},{"metric":{"verb":"APPLY"},"value":[1759904500,"30"]},{"metric":{"verb":"POST"},"value":[1759904500,"5"]},{"metric":{"verb":"PUT"},"value":[1759904500,"2"]},{"metric":{"verb":"PATCH"},"value":[1759904500,"1"]}]' ;;
     *)
         echo "curl-fixture: unmatched PromQL query: $query" >&2
         exit 1

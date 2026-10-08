@@ -1236,7 +1236,9 @@ debug_probe_criteria() {
     verb_raw=$(debug_query_raw "sum by (verb) (rate(apiserver_request_total[${window}]))" "criteria_api_by_verb")
     by_verb=$(echo "$verb_raw" | jq -c '[.data.result[] | {verb: (.metric.verb // "?"), req_per_sec: .value[1]}] | sort_by(-(.req_per_sec | tonumber))' 2>/dev/null || echo "[]")
     read_rate=$(echo "$by_verb" | jq -r '[.[] | select((.verb // "") | ascii_downcase | test("^(get|list|watch)$")) | .req_per_sec | tonumber] | add // 0' 2>/dev/null)
-    write_rate=$(echo "$by_verb" | jq -r '[.[] | select((.verb // "") | ascii_downcase | test("^(create|update|patch|delete|deletecollection|post|put)$")) | .req_per_sec | tonumber] | add // 0' 2>/dev/null)
+    # Server-side apply (APPLY) writes objects just like PUT/PATCH, so it
+    # belongs in the write bucket (observed at ~30 req/s on mmacik-sno).
+    write_rate=$(echo "$by_verb" | jq -r '[.[] | select((.verb // "") | ascii_downcase | test("^(create|update|patch|delete|deletecollection|post|put|apply)$")) | .req_per_sec | tonumber] | add // 0' 2>/dev/null)
     read_rate=${read_rate:-0}
     write_rate=${write_rate:-0}
     probe+="\"api_server\": {\"window\": \"${window}\", \"by_verb\": ${by_verb:-[]}, \"read_req_per_sec\": \"${read_rate}\", \"write_req_per_sec\": \"${write_rate}\"},"
@@ -1253,7 +1255,10 @@ debug_probe_criteria() {
 
         local pod_lines pods_json ev_tail ev_total ev_match
         pod_lines=$(timeout 10 oc get pods -n "$ns" --no-headers 2>/dev/null | grep -E "controller-manager|operator|dashboard" | head -20)
-        pods_json=$(echo "$pod_lines" | jq -Rsc 'split("\n") | map(select(length > 0)) | map([splits("\\s+")] | {pod: .[0], ready: .[1], status: .[2], restarts: .[3], age: .[4]})' 2>/dev/null || echo "[]")
+        # oc annotates RESTARTS as "N (Nd ago)" once a pod has restarted,
+        # which shifts AGE out of column 5 — the age is always the LAST
+        # whitespace-separated field, so parse from the end.
+        pods_json=$(echo "$pod_lines" | jq -Rsc 'split("\n") | map(select(length > 0)) | map([splits("\\s+")] | {pod: .[0], ready: .[1], status: .[2], restarts: .[3], age: .[-1]})' 2>/dev/null || echo "[]")
 
         ev_tail=$(timeout 10 oc get events -n "$ns" --sort-by='.lastTimestamp' 2>/dev/null | tail -20)
         ev_total=$(printf '%s\n' "$ev_tail" | grep -c '.' 2>/dev/null)

@@ -35,10 +35,13 @@ case "$*" in
     *"get namespace "*)
         exit 0
         ;;
-    # Operator pod inventory (debug_probe_criteria)
+    # Operator pod inventory (debug_probe_criteria). The first two pods
+    # carry oc's restart annotation — RESTARTS renders as "N (Nd ago)" —
+    # which shifts AGE out of column 5; the code must parse it from the
+    # last field.
     *"get pods -n "*)
-        echo "rhods-operator-controller-manager-abc  1/1  Running  0  14d"
-        echo "rhods-dashboard-xyz                     2/2  Running  1  13d"
+        echo "rhods-operator-controller-manager-abc  1/1  Running  3 (28h ago)  14d"
+        echo "rhods-dashboard-xyz                     2/2  Running  1 (11d ago)  13d"
         echo "odh-model-controller-manager-qqq        1/1  Running  0  3d"
         echo "model-registry-xyz                      1/1  Running  0  2d"
         ;;
