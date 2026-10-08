@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# timeout shim: ignore the duration, just exec the command (macOS-safe).
+shift
+exec "$@"

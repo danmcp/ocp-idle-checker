@@ -211,3 +211,15 @@ ML_NODE_PATTERN="p5|p4d|g5"
 **Script hangs**
 - Built-in 10-second timeouts on all `oc` commands
 - If persistent, check cluster API responsiveness
+
+## Tests
+
+The `tests/` directory holds a hermetic test suite — no cluster, no network, no `oc` login required:
+
+```bash
+bash tests/run-tests.sh
+```
+
+Fake `oc`, `curl`, and `timeout` binaries (`tests/fixtures/bin/`) stand in for the real tools. The fake `curl` decodes each PromQL query and answers it with canned data, so a query whose shape changes in the script fails the tests instead of silently degrading on a real cluster; unrecognized `oc`/`curl` invocations fail loudly rather than returning empty output.
+
+The suite covers the debug-probe JSON assembly (DCGM samples, per-node breakdown, spike detection, criteria detail, query timings) and `export_json` — both with the debug section present and with it absent.
