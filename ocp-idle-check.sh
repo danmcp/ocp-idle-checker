@@ -21,6 +21,8 @@ EVENT_TIME_MINUTES=60          # Check events in last N minutes (informational o
 TIME_WINDOW_MINUTES=10         # Time window for CPU/Memory average calculations (0 = instant only)
 CHECK_ML_NODES=true            # Set to false to disable ML node specific checks
 ML_NODE_PATTERN="p5|p4d|g5"    # Instance types to consider as ML nodes
+DEBUG_PROBE=true              # Collect fleet-debug data (DCGM availability, per-node, buckets, timings)
+DEBUG_BUCKET_THRESHOLD=20     # Hypothetical 15-minute bucket rule threshold, % CPU (debug only)
 VERBOSE=true                   # Set to false for minimal output
 EXPORT_CSV=""                  # Path to export CSV file (empty = no export)
 EXPORT_JSON=""                 # Path to export JSON file (empty = no export)
@@ -54,6 +56,11 @@ Options:
   --csv FILE                Export results to CSV file
   --json FILE               Export results to JSON file
   --token TOKEN             Use pre-generated Prometheus token (skip token minting)
+  --debug-probe             Collect fleet-debug data: DCGM GPU metrics availability,
+                            per-node CPU/memory breakdown, 15-minute bucket analysis,
+                            api-server verb mix, operator pod inventory, query timings,
+                            and namespace scrape labels. Adds a "debug" section to
+                            --json output; never affects the verdict.
   -q, --quiet               Quiet mode - show only criteria results and status
   --no-ml-check             Skip ML node specific checks
   -h, --help                Show this help message
@@ -117,6 +124,10 @@ while [[ $# -gt 0 ]]; do
         --token)
             PROMETHEUS_TOKEN_ARG="$2"
             shift 2
+            ;;
+        --debug-probe)
+            DEBUG_PROBE=true
+            shift
             ;;
         -q|--quiet)
             VERBOSE=false
@@ -282,6 +293,24 @@ query_prometheus() {
         [[ "$VERBOSE" == "true" ]] && log_warning "Result data: $result_data"
     fi
 
+    echo "$result"
+}
+
+# Debug wrapper around query_prometheus: records wall-clock duration and result
+# per query into QUERY_TIMINGS_LOG. Active only when DEBUG_PROBE=true.
+query_prometheus_timed() {
+    if [[ "$DEBUG_PROBE" != "true" ]]; then
+        query_prometheus "$1"
+        return
+    fi
+    local label="$2"
+    local start_ms=$(debug_now_ms)
+    local result=$(query_prometheus "$1")
+    local end_ms=$(debug_now_ms)
+    if [[ "$label" == "" ]]; then
+        label=$(echo "$1" | head -c 120)
+    fi
+    debug_record_timing "$label" "$result" $((end_ms - start_ms))
     echo "$result"
 }
 
@@ -851,6 +880,422 @@ get_recent_pod_activity() {
     pod_events=${pod_events:-0}
 
     echo "$pod_events"
+}
+
+# === DEBUG PROBE (experimental, never affects the verdict) ===
+# Collects the evidence needed to evaluate fixes for the known false-idle
+# problems, plus the raw material (api-server verb mix, operator pod
+# inventory) for judging whether the existing criteria thresholds are
+# meaningful. All output goes to a "debug" section in the JSON export and to
+# stderr logs; the standard criteria/verdict logic is untouched.
+
+QUERY_TIMINGS_LOG=$(mktemp /tmp/ocp-idle-query-timings.XXXXXX)
+
+# Append one "label|result|duration" line to the timings log, flattened back
+# into JSON by debug_collect_all. Active only when DEBUG_PROBE=true.
+debug_record_timing() {
+    [[ "$DEBUG_PROBE" == "true" ]] && echo "$1|$2|${3}ms" >> "$QUERY_TIMINGS_LOG"
+}
+
+# Run a raw query and return the FULL JSON response (not just first value).
+# Used by the debug probes where we need result counts and label sets.
+# $2 (optional) labels the entry recorded in the query-timings log; without
+# it the probes are invisible to query_timings, which is why the first fleet
+# run recorded a single timing next to a dozen queries.
+debug_query_raw() {
+    local query="$1"
+    local label="${2:-unlabeled}"
+    local thanos_host
+    thanos_host=$(timeout 5 oc get route thanos-querier -n openshift-monitoring -o jsonpath='{.spec.host}' 2>/dev/null)
+    if [[ -z "$thanos_host" ]]; then
+        debug_record_timing "$label" "route-unavailable" 0
+        echo '{"status":"error","errorType":"route-unavailable"}'
+        return 1
+    fi
+    local start_ms response end_ms status
+    start_ms=$(debug_now_ms)
+    response=$(timeout 120 curl -sk -H "Authorization: Bearer $PROMETHEUS_TOKEN" \
+        "https://$thanos_host/api/v1/query?query=$(echo "$query" | jq -sRr @uri)" 2>/dev/null)
+    end_ms=$(debug_now_ms)
+    status=$(echo "$response" | jq -r '.status // "non-json"' 2>/dev/null)
+    debug_record_timing "$label" "${status:-non-json}" $(( end_ms - start_ms ))
+    echo "$response"
+}
+
+# Range query against the same thanos-querier route: the expression is
+# evaluated server-side at each step between start and end (epoch seconds),
+# and the caller aggregates the returned points client-side. This is the
+# standard API for "what happened over this period" and avoids subquery
+# evaluation, whose window coverage the first fleet run found unreliable.
+# $5 (optional) labels the timings-log entry.
+debug_query_range_raw() {
+    local query="$1" start_s="$2" end_s="$3" step_s="$4"
+    local label="${5:-unlabeled-range}"
+    local thanos_host
+    thanos_host=$(timeout 5 oc get route thanos-querier -n openshift-monitoring -o jsonpath='{.spec.host}' 2>/dev/null)
+    if [[ -z "$thanos_host" ]]; then
+        debug_record_timing "$label" "route-unavailable" 0
+        echo '{"status":"error","errorType":"route-unavailable"}'
+        return 1
+    fi
+    local start_ms response end_ms status
+    start_ms=$(debug_now_ms)
+    response=$(timeout 180 curl -sk -G -H "Authorization: Bearer $PROMETHEUS_TOKEN" \
+        --data-urlencode "query=$query" \
+        --data-urlencode "start=$start_s" --data-urlencode "end=$end_s" \
+        --data-urlencode "step=${step_s}s" \
+        "https://$thanos_host/api/v1/query_range" 2>/dev/null)
+    end_ms=$(debug_now_ms)
+    status=$(echo "$response" | jq -r '.status // "non-json"' 2>/dev/null)
+    debug_record_timing "$label" "${status:-non-json}" $(( end_ms - start_ms ))
+    echo "$response"
+}
+
+# JSON-escape a raw string for embedding in the debug JSON output.
+# Note: no -r on jq - we want the quoted, escaped JSON string form.
+debug_json_escape() {
+    # printf, not echo: jq -sR slurps the whole input, and echo's trailing
+    # newline would land inside the string as a literal \n.
+    printf '%s' "$1" | jq -sR .
+}
+
+# Current time in ms. GNU date supports %3N; BSD date does not and prints
+# garbage - fall back to whole seconds in that case.
+debug_now_ms() {
+    local t
+    t=$(date +%s%3N 2>/dev/null)
+    if [[ "$t" =~ ^[0-9]{13}$ ]]; then
+        echo "$t"
+    else
+        echo $(( $(date +%s) * 1000 ))
+    fi
+}
+
+# DCGM availability probe: settles whether GPU utilization series exist in
+# the platform metrics store, and why not if they don't. When they do exist,
+# also records GPU activity over the full window (peak and average
+# utilization, peak/average VRAM, sample coverage): a GPU that ran anything
+# at all during the week shows up here even when the instant sample reads
+# 0%. Plain range selectors throughout - no subqueries - so these do not
+# depend on the evaluation path the spike probe found unreliable.
+debug_probe_dcgm() {
+    local window="${TIME_WINDOW_MINUTES}m"
+    local probe='{'
+    local util_raw fb_raw series_count dcgm_pods ns_labels thanos_route
+
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo "--- DEBUG: DCGM GPU metrics availability probe ---" >&2
+    fi
+
+    # 1. DCGM_FI_DEV_GPU_UTIL - the headline question
+    util_raw=$(debug_query_raw 'DCGM_FI_DEV_GPU_UTIL' "dcgm_gpu_util_instant")
+    series_count=$(echo "$util_raw" | jq -r '.data.result | length' 2>/dev/null || echo "0")
+    probe+="\"dcgm_gpu_util_series\": ${series_count:-0},"
+    if [[ "${series_count:-0}" -gt 0 ]] 2>/dev/null; then
+        # Sample values to show what utilization actually looks like. The
+        # host label varies by dcgm-exporter version and deployment
+        # (Hostname, node, kubernetes_node, or only the target's instance) -
+        # coalesce them all; the first run printed null by assuming one.
+        local util_samples util_win_max util_win_avg util_win_cnt
+        util_samples=$(echo "$util_raw" | jq -c '[.data.result[] | {node: ((.metric.node // .metric.Hostname // .metric.kubernetes_node // .metric.instance // .metric.pod) | sub(":[0-9]+$"; "")), gpu: .metric.gpu, util: .value[1]}] | .[0:8]' 2>/dev/null || echo "[]")
+        probe+="\"dcgm_gpu_util_samples\": ${util_samples},"
+        util_win_max=$(debug_query_raw "max by (gpu) (max_over_time(DCGM_FI_DEV_GPU_UTIL[${window}]))" "dcgm_gpu_util_max_window")
+        util_win_max=$(echo "$util_win_max" | jq -c '[.data.result[] | {gpu: .metric.gpu, max_util_pct: .value[1]}]' 2>/dev/null || echo "[]")
+        util_win_avg=$(debug_query_raw "avg by (gpu) (avg_over_time(DCGM_FI_DEV_GPU_UTIL[${window}]))" "dcgm_gpu_util_avg_window")
+        util_win_avg=$(echo "$util_win_avg" | jq -c '[.data.result[] | {gpu: .metric.gpu, avg_util_pct: .value[1]}]' 2>/dev/null || echo "[]")
+        util_win_cnt=$(debug_query_raw "count by (gpu) (count_over_time(DCGM_FI_DEV_GPU_UTIL[${window}]))" "dcgm_gpu_util_samples_window")
+        util_win_cnt=$(echo "$util_win_cnt" | jq -c '[.data.result[] | {gpu: .metric.gpu, samples: .value[1]}]' 2>/dev/null || echo "[]")
+        probe+="\"dcgm_gpu_util_window\": {\"max\": ${util_win_max}, \"avg\": ${util_win_avg}, \"samples\": ${util_win_cnt}},"
+    fi
+
+    # 2. DCGM_FI_DEV_FB_USED - VRAM usage (frame buffer memory used in MiB).
+    # Average vs peak separates "a model was resident essentially all week"
+    # (avg ~= max) from "something loaded briefly and freed" (avg << max).
+    fb_raw=$(debug_query_raw 'DCGM_FI_DEV_FB_USED' "dcgm_fb_used_instant")
+    series_count=$(echo "$fb_raw" | jq -r '.data.result | length' 2>/dev/null || echo "0")
+    probe+="\"dcgm_fb_used_series\": ${series_count:-0},"
+    if [[ "${series_count:-0}" -gt 0 ]] 2>/dev/null; then
+        local fb_samples fb_win_max fb_win_avg
+        fb_samples=$(echo "$fb_raw" | jq -c '[.data.result[] | {node: ((.metric.node // .metric.Hostname // .metric.kubernetes_node // .metric.instance // .metric.pod) | sub(":[0-9]+$"; "")), gpu: .metric.gpu, fb_used_mib: .value[1]}] | .[0:8]' 2>/dev/null || echo "[]")
+        probe+="\"dcgm_fb_used_samples\": ${fb_samples},"
+        fb_win_max=$(debug_query_raw "max by (gpu) (max_over_time(DCGM_FI_DEV_FB_USED[${window}]))" "dcgm_fb_used_max_window")
+        fb_win_max=$(echo "$fb_win_max" | jq -c '[.data.result[] | {gpu: .metric.gpu, max_fb_used_mib: .value[1]}]' 2>/dev/null || echo "[]")
+        fb_win_avg=$(debug_query_raw "avg by (gpu) (avg_over_time(DCGM_FI_DEV_FB_USED[${window}]))" "dcgm_fb_used_avg_window")
+        fb_win_avg=$(echo "$fb_win_avg" | jq -c '[.data.result[] | {gpu: .metric.gpu, avg_fb_used_mib: .value[1]}]' 2>/dev/null || echo "[]")
+        probe+="\"dcgm_fb_used_window\": {\"max\": ${fb_win_max}, \"avg\": ${fb_win_avg}},"
+    fi
+
+    # 3. Is dcgm-exporter deployed anywhere? (pod presence) - match by pod
+    # NAME, not label: the GPU operator's pods don't carry
+    # app=dcgm-exporter, which is why the first run reported 0 pods next to
+    # live DCGM series.
+    local dcgm_pod_list
+    # Match by name: GPU operator pods carry no app= selector, and a bare
+    # /dcgm/ also catches the operator's non-exporter dcgm service pods.
+    dcgm_pod_list=$(timeout 10 oc get pods -A --no-headers 2>/dev/null | awk '$2 ~ /dcgm-exporter/ {print $1 "/" $2}')
+    dcgm_pods=$(printf '%s' "$dcgm_pod_list" | awk 'END {print NR}')
+    probe+="\"dcgm_exporter_pods\": ${dcgm_pods:-0},"
+    probe+="\"dcgm_exporter_pod_names\": $(printf '%s' "$dcgm_pod_list" | jq -Rsc 'split("\n") | map(select(length > 0)) | .[0:8]'),"
+
+    # 4. Namespace scrape-enabling labels (platform Prometheus only scrapes
+    # ServiceMonitors in namespaces labeled openshift.io/cluster-monitoring=true)
+    ns_labels=$(timeout 10 oc get ns -L openshift.io/cluster-monitoring 2>/dev/null | grep -Ei 'gpu|dcgm|nvidia' || echo "(none found)")
+    probe+="\"gpu_namespace_labels\": $(debug_json_escape "$ns_labels"),"
+
+    # 5. Sanity check that the query path itself works (node metric should always return)
+    local sanity
+    sanity=$(debug_query_raw 'count(node_cpu_seconds_total)' "sanity_node_series")
+    local sanity_count
+    sanity_count=$(echo "$sanity" | jq -r '.data.result[0].value[1] // "N/A"' 2>/dev/null)
+    probe+="\"sanity_node_series_count\": \"${sanity_count:-N/A}\","
+
+    # 6. Can thanos-querier be reached at all
+    thanos_route=$(timeout 5 oc get route thanos-querier -n openshift-monitoring -o jsonpath='{.spec.host}' 2>/dev/null)
+    probe+="\"thanos_route_reachable\": $( [[ -n "$thanos_route" ]] && echo true || echo false ),"
+
+    probe="${probe%,}}"
+    echo "$probe"
+}
+
+# Per-node breakdown: shows how much node dilution is happening on this cluster.
+debug_probe_per_node() {
+    local window="${TIME_WINDOW_MINUTES}m"
+    local probe='{'
+    local raw
+
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo "--- DEBUG: per-node CPU/memory breakdown ---" >&2
+    fi
+
+    # Per-node windowed CPU (what the main check averages into one number).
+    # Group by (node, instance): node_cpu_seconds_total on OCP carries no
+    # "node" label, so grouping by node alone collapses the whole cluster
+    # into a single unlabeled series (that is why the first run printed
+    # node: null and one "per-node" number). Grouping by both yields one
+    # series per node everywhere.
+    raw=$(debug_query_raw "(1 - avg by (node, instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[${window}]))) * 100" "per_node_cpu_windowed")
+    local per_node_cpu
+    per_node_cpu=$(echo "$raw" | jq -c '[.data.result[] | {node: ((.metric.node // .metric.instance // "?") | sub(":[0-9]+$"; "")), cpu_pct: .value[1]}]' 2>/dev/null || echo "[]")
+    probe+="\"per_node_cpu_windowed\": ${per_node_cpu},"
+
+    # Cluster average as the main check computes it, for side-by-side comparison
+    local cluster_avg
+    cluster_avg=$(query_prometheus_timed "(1 - avg(rate(node_cpu_seconds_total{mode=\"idle\"}[${window}]))) * 100" "debug_cluster_avg_cpu")
+    probe+="\"cluster_avg_cpu_windowed\": \"${cluster_avg}\","
+
+    # Per-node windowed memory (same node/instance grouping fix)
+    raw=$(debug_query_raw "100 * (1 - avg_over_time((avg by (node, instance) (node_memory_MemAvailable_bytes) / avg by (node, instance) (node_memory_MemTotal_bytes))[${window}:]))" "per_node_mem_windowed")
+    local per_node_mem
+    per_node_mem=$(echo "$raw" | jq -c '[.data.result[] | {node: ((.metric.node // .metric.instance // "?") | sub(":[0-9]+$"; "")), mem_pct: .value[1]}]' 2>/dev/null || echo "[]")
+    probe+="\"per_node_mem_windowed\": ${per_node_mem},"
+
+    # Raw instant per-node (no averaging) for spike visibility
+    local top_raw
+    top_raw=$(timeout 10 oc adm top nodes --no-headers 2>/dev/null | awk '{print $1 "|" $3 "|" $5}')
+    if [[ -n "$top_raw" ]]; then
+        local instant_json
+        instant_json=$(echo "$top_raw" | awk -F'|' '{printf "%s{\"node\": \"%s\", \"cpu_pct\": \"%s\", \"mem_pct\": \"%s\"}", (NR>1 ? "," : ""), $1, $2, $3}')
+        probe+="\"per_node_instant\": [${instant_json}],"
+    fi
+
+    probe="${probe%,}}"
+    echo "$probe"
+}
+
+# Spike/activity probe: was there ANY CPU activity worth noticing during the
+# window, not just the week-long average the main check uses? A cluster can
+# average 21% CPU while sitting at 2% nearly all week - the average alone
+# can't tell those two stories apart.
+#
+# The detector answers one question: did any 15-minute-average CPU value in
+# the window exceed the threshold? Two data sources for that one question,
+# because the first fleet run showed a single-source version lying: a
+# subquery max reported 14.7% as the highest 15-minute average of the week
+# while the plain week-long average was 21.5% - impossible on the same data,
+# so the subquery evidently evaluated only part of the window (Thanos partial
+# responses are the prime suspect), and it cannot prove its own coverage.
+#   query_range    - the 15-minute-average expression evaluated server-side
+#                    at every step via /api/v1/query_range; max,
+#                    when-it-happened, and time-above-threshold computed
+#                    client-side from the returned points. The primary
+#                    source: it reports exactly how much of the window it
+#                    saw, so a partial answer is labeled, not silent.
+#   recording_rule - OCP's own node:node_cpu_utilisation:ratio_5m/1h series
+#                    when present: max_over_time over a plain range
+#                    selector, no subquery and no long rate window. The
+#                    fallback if query_range comes back with holes.
+debug_probe_spikes() {
+    local window="${TIME_WINDOW_MINUTES}m"
+    local step_s=900
+    local expected_points=$(( TIME_WINDOW_MINUTES * 60 / step_s + 1 ))
+    local probe='{'
+    probe+="\"bucket_threshold_pct\": ${DEBUG_BUCKET_THRESHOLD},"
+
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo "--- DEBUG: spike/activity analysis (hypothetical rule, verdict not affected) ---" >&2
+    fi
+
+    # --- Primary source: query_range, one server-side evaluation per step ---
+    local range_json range_summary="error" range_min_cov="n/a" raw_range range_nodes range_active
+    local end_s start_s
+    end_s=$(date +%s)
+    start_s=$(( end_s - TIME_WINDOW_MINUTES * 60 ))
+    raw_range=$(debug_query_range_raw \
+        "(1 - avg by (node, instance) (rate(node_cpu_seconds_total{mode=\"idle\"}[15m]))) * 100" \
+        "$start_s" "$end_s" "$step_s" "spikes_query_range")
+    if [[ "$(echo "$raw_range" | jq -r '.status' 2>/dev/null)" == "success" ]]; then
+        range_nodes=$(echo "$raw_range" | jq -c --argjson thr "$DEBUG_BUCKET_THRESHOLD" --argjson expected "$expected_points" \
+            '[.data.result[] | {
+                node: ((.metric.node // .metric.instance // "?") | sub(":[0-9]+$"; "")),
+                points: (.values | length),
+                coverage_pct: (((.values | length) * 10000 / $expected | floor) / 100),
+                coverage_start: (if (.values | length) > 0 then (.values[0][0] | todate) else null end),
+                coverage_end: (if (.values | length) > 0 then (.values[-1][0] | todate) else null end),
+                max_15m_avg_cpu_pct: ([.values[][1] | tonumber] | max),
+                max_at: (if (.values | length) > 0 then (.values | max_by(.[1] | tonumber) | .[0] | todate) else null end),
+                windows_above_threshold: ([.values[][1] | tonumber | select(. > $thr)] | length),
+                pct_windows_above_threshold: ((([.values[][1] | tonumber | select(. > $thr)] | length) * 10000 / (.values | length) | floor) / 100),
+                would_flag_active: (([.values[][1] | tonumber] | max) > $thr)
+            }]' 2>/dev/null || echo "[]")
+        range_active=$(echo "$range_nodes" | jq '[.[] | select(.would_flag_active)] | length' 2>/dev/null || echo "0")
+        range_min_cov=$(echo "$range_nodes" | jq -r 'if length > 0 then ([.[].coverage_pct] | min | tostring) else "0" end')
+        range_json="{\"status\": \"ok\", \"step_seconds\": ${step_s}, \"expected_points\": ${expected_points}, \"per_node\": ${range_nodes}, \"verdict\": $( [[ "$range_active" -gt 0 ]] && echo '"ACTIVE"' || echo '"IDLE"' )}"
+        range_summary="max $(echo "$range_nodes" | jq -r 'if length > 0 then ([.[].max_15m_avg_cpu_pct] | max | floor | tostring) + "%" else "no data" end'), $(echo "$range_nodes" | jq -r '[.[].points] | add // 0') points"
+    else
+        local err
+        err=$(echo "$raw_range" | jq -r '.error // .errorType // "unknown"' 2>/dev/null)
+        range_json="{\"status\": \"error\", \"error\": $(debug_json_escape "${err}")}"
+    fi
+    probe+="\"query_range\": ${range_json},"
+
+    # --- Fallback: platform recording rules, if OCP ships them ---
+    local rule_json rule_summary="n/a" rule_name="" candidate raw_cnt cnt raw_rule rule_nodes rule_counts rule_active
+    for candidate in node:node_cpu_utilisation:ratio_5m node:node_cpu_utilisation:ratio_1h; do
+        raw_cnt=$(debug_query_raw "count(${candidate})" "spikes_rule_count_${candidate##*:}")
+        cnt=$(echo "$raw_cnt" | jq -r '.data.result[0].value[1] // "0"' 2>/dev/null)
+        if [[ "$cnt" =~ ^[0-9]+$ ]] && [[ "$cnt" -gt 0 ]]; then
+            rule_name="$candidate"
+            break
+        fi
+    done
+    if [[ -n "$rule_name" ]]; then
+        raw_rule=$(debug_query_raw "max by (node, instance) (max_over_time(${rule_name}[${window}])) * 100" "spikes_rule_max")
+        rule_nodes=$(echo "$raw_rule" | jq -c --argjson thr "$DEBUG_BUCKET_THRESHOLD" \
+            '[.data.result[] | {node: ((.metric.node // .metric.instance // "?") | sub(":[0-9]+$"; "")), max_util_pct: .value[1], would_flag_active: ((.value[1] | tonumber) > $thr)}]' 2>/dev/null || echo "[]")
+        raw_rule=$(debug_query_raw "count by (node, instance) (count_over_time(${rule_name}[${window}]))" "spikes_rule_coverage")
+        rule_counts=$(echo "$raw_rule" | jq -c '[.data.result[] | {node: ((.metric.node // .metric.instance // "?") | sub(":[0-9]+$"; "")), samples: .value[1]}]' 2>/dev/null || echo "[]")
+        rule_active=$(echo "$rule_nodes" | jq '[.[] | select(.would_flag_active)] | length' 2>/dev/null || echo "0")
+        rule_json="{\"available\": true, \"rule\": \"${rule_name}\", \"per_node\": ${rule_nodes}, \"sample_counts\": ${rule_counts}, \"verdict\": $( [[ "$rule_active" -gt 0 ]] && echo '"ACTIVE"' || echo '"IDLE"' )}"
+        rule_summary="max $(echo "$rule_nodes" | jq -r 'if length > 0 then ([.[].max_util_pct | tonumber] | max | floor | tostring) + "%" else "no data" end') via ${rule_name}"
+    else
+        rule_json="{\"available\": false, \"candidates_checked\": [\"node:node_cpu_utilisation:ratio_5m\", \"node:node_cpu_utilisation:ratio_1h\"]}"
+        rule_summary="no utilization recording rules found"
+    fi
+    probe+="\"recording_rules\": ${rule_json},"
+
+    # Headline verdict: prefer query_range (it proves its coverage), then the
+    # recording rule.
+    local verdict="UNKNOWN" verdict_source="no method succeeded"
+    if [[ "$(echo "$range_json" | jq -r '.status // empty' 2>/dev/null)" == "ok" ]]; then
+        verdict=$(echo "$range_json" | jq -r '.verdict')
+        verdict_source="query_range (min node coverage ${range_min_cov}%)"
+    elif [[ -n "$rule_name" ]]; then
+        verdict=$(echo "$rule_json" | jq -r '.verdict')
+        verdict_source="recording_rule ${rule_name}"
+    fi
+    probe+="\"hypothetical_rule_verdict\": \"${verdict}\","
+    probe+="\"verdict_source\": $(debug_json_escape "$verdict_source"),"
+
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo "    query_range:    ${range_summary} [min node coverage ${range_min_cov}%]" >&2
+        echo "    recording rule: ${rule_summary}" >&2
+        echo "    hypothetical rule verdict: ${verdict} (from ${verdict_source})" >&2
+    fi
+
+    probe="${probe%,}}"
+    echo "$probe"
+}
+
+# Raw material behind the api_server and operators criteria, so fleet runs
+# can show what those thresholds actually measure. The api_server criterion
+# sees a single number (total req/sec over the window); the validation
+# question is its composition — platform read churn (GET/LIST/WATCH from
+# controllers) vs mutating traffic (CREATE/UPDATE/PATCH/DELETE). The
+# operators criterion also sees a single number (oldest matching pod age);
+# the question is which pods and how much event activity sit behind it.
+# Mirrors get_operator_age()/check_operator_events() (same pod regex, same
+# event grep) but exports every matching pod instead of head -5, and exports
+# the event count the criterion compares against 5.
+debug_probe_criteria() {
+    local probe='{'
+
+    # --- api_server: request rate by verb over the criterion's own window ---
+    local window="5m"
+    [[ $TIME_WINDOW_MINUTES -gt 0 ]] && window="${TIME_WINDOW_MINUTES}m"
+    local verb_raw by_verb read_rate write_rate
+    verb_raw=$(debug_query_raw "sum by (verb) (rate(apiserver_request_total[${window}]))" "criteria_api_by_verb")
+    by_verb=$(echo "$verb_raw" | jq -c '[.data.result[] | {verb: (.metric.verb // "?"), req_per_sec: .value[1]}] | sort_by(-(.req_per_sec | tonumber))' 2>/dev/null || echo "[]")
+    read_rate=$(echo "$by_verb" | jq -r '[.[] | select((.verb // "") | ascii_downcase | test("^(get|list|watch)$")) | .req_per_sec | tonumber] | add // 0' 2>/dev/null)
+    write_rate=$(echo "$by_verb" | jq -r '[.[] | select((.verb // "") | ascii_downcase | test("^(create|update|patch|delete|deletecollection|post|put)$")) | .req_per_sec | tonumber] | add // 0' 2>/dev/null)
+    read_rate=${read_rate:-0}
+    write_rate=${write_rate:-0}
+    probe+="\"api_server\": {\"window\": \"${window}\", \"by_verb\": ${by_verb:-[]}, \"read_req_per_sec\": \"${read_rate}\", \"write_req_per_sec\": \"${write_rate}\"},"
+
+    # --- operators: per-namespace pod inventory and event activity ---
+    # Same namespace-existence skip as the criterion: missing namespaces are
+    # what make the criterion N/A on non-ODH clusters.
+    local ns_entries="" ns_count=0
+    local ns
+    IFS=',' read -ra CRIT_NAMESPACES <<< "$OPERATOR_NAMESPACES"
+    for ns in "${CRIT_NAMESPACES[@]}"; do
+        ns=$(echo "$ns" | xargs)
+        timeout 5 oc get namespace "$ns" &>/dev/null || continue
+
+        local pod_lines pods_json ev_tail ev_total ev_match
+        pod_lines=$(timeout 10 oc get pods -n "$ns" --no-headers 2>/dev/null | grep -E "controller-manager|operator|dashboard" | head -20)
+        pods_json=$(echo "$pod_lines" | jq -Rsc 'split("\n") | map(select(length > 0)) | map([splits("\\s+")] | {pod: .[0], ready: .[1], status: .[2], restarts: .[3], age: .[4]})' 2>/dev/null || echo "[]")
+
+        ev_tail=$(timeout 10 oc get events -n "$ns" --sort-by='.lastTimestamp' 2>/dev/null | tail -20)
+        ev_total=$(printf '%s\n' "$ev_tail" | grep -c '.' 2>/dev/null)
+        ev_match=$(printf '%s\n' "$ev_tail" | grep -Eic "reconcil|created|updated|scaled" 2>/dev/null)
+        ev_total=${ev_total:-0}
+        ev_match=${ev_match:-0}
+
+        [[ -n "$ns_entries" ]] && ns_entries+=","
+        ns_entries+="{\"namespace\": \"${ns}\", \"pods\": ${pods_json:-[]}, \"events_in_tail\": ${ev_total}, \"matching_events\": ${ev_match}}"
+        ((ns_count++))
+    done
+
+    local pod_count=0
+    [[ -n "$ns_entries" ]] && pod_count=$(echo "[$ns_entries]" | jq '[.[].pods[]] | length' 2>/dev/null)
+    probe+="\"operators\": {\"age_threshold_days\": ${OPERATOR_IDLE_AGE_DAYS}, \"event_threshold\": 5, \"namespaces\": [${ns_entries}]}"
+
+    if [[ "$VERBOSE" == "true" ]]; then
+        echo "    api verbs:      read ${read_rate}/s, write ${write_rate}/s (window ${window})" >&2
+        echo "    operators:      ${ns_count} namespace(s), ${pod_count} matching pod(s)" >&2
+    fi
+
+    echo "${probe}}"
+}
+
+# Assemble the full debug section as a JSON object string.
+debug_collect_all() {
+    local probe='{'
+    probe+="\"dcgm\": $(debug_probe_dcgm),"
+    probe+="\"per_node\": $(debug_probe_per_node),"
+    probe+="\"spikes\": $(debug_probe_spikes),"
+    probe+="\"criteria_detail\": $(debug_probe_criteria),"
+
+    # Query timings from QUERY_TIMINGS_LOG
+    local timings_json
+    timings_json=$(awk -F'|' '{printf "%s{\"label\": \"%s\", \"result\": \"%s\", \"duration\": \"%s\"}", (NR>1 ? "," : ""), $1, $2, $3}' "$QUERY_TIMINGS_LOG" 2>/dev/null)
+    probe+="\"query_timings\": [${timings_json}],"
+
+    # N/A census: which criteria reported UNKNOWN
+    probe+="\"na_census\": {\"cpu\": \"${cpu_result:-unset}\", \"memory\": \"${mem_result:-unset}\", \"api_server\": \"${api_result:-unset}\", \"operators\": \"${operator_result:-unset}\"},"
+
+    probe="${probe%,}}"
+    echo "$probe"
 }
 
 # === MAIN SCRIPT ===
@@ -1495,6 +1940,14 @@ else
     EXIT_CODE=0  # Exit 0 for ACTIVE (success - resources being used)
 fi
 
+# === DEBUG PROBE COLLECTION ===
+# Runs after the verdict so per-node/bucket data can be compared against it.
+# Never modifies FINAL_STATUS or EXIT_CODE.
+DEBUG_JSON=""
+if [[ "$DEBUG_PROBE" == "true" ]]; then
+    DEBUG_JSON=$(debug_collect_all)
+fi
+
 if [[ "$VERBOSE" == "true" ]]; then
     echo "========================================"
     echo "         IDLE DETECTION SUMMARY"
@@ -1576,6 +2029,14 @@ export_json() {
     [[ "$gpu_flavors_val" == "N/A" ]] && gpu_flavors_val="null" || gpu_flavors_val="\"$gpu_flavors_val\""
     [[ "$gpu_age_val" == "N/A" ]] && gpu_age_val="null" || gpu_age_val="\"$gpu_age_val\""
 
+    # Assemble the optional debug tail before the heredoc: literal quotes
+    # inside a ${VAR:+...} expansion are stripped by quote removal, and
+    # backslash-escapes in a heredoc body are never unescaped, so the only
+    # clean way to emit a quoted key conditionally is a separate variable.
+    local debug_tail=""
+    [[ -n "$DEBUG_JSON" ]] && debug_tail=",
+  \"debug\": ${DEBUG_JSON}"
+
     # Create JSON
     cat > "$json_file" << EOF
 {
@@ -1623,7 +2084,7 @@ export_json() {
       "cpu_windowed": ${gpu_cpu_windowed_val},
       "memory_windowed": ${gpu_mem_windowed_val}
     }
-  }
+  }${debug_tail}
 }
 EOF
 }
