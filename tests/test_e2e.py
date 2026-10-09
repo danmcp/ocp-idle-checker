@@ -348,3 +348,28 @@ def test_shim_old_python3_exits_2(monkeypatch, tmp_path):
     assert proc.returncode == 2
     assert "python3 >= 3.12 required" in proc.stderr
     assert "Python 3.6.9" in proc.stderr
+
+
+def test_shim_prefers_python312_over_old_bare_python3(monkeypatch, tmp_path):
+    # The Jenkins agent image ships a bare python3 of 3.9 alongside a full
+    # python3.12; the shim must run the module with the versioned name.
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    old = fake_bin / "python3"
+    old.write_text("#!/bin/bash\necho 'Python 3.9.25'\nexit 1\n")
+    old.chmod(0o755)
+    fake_312 = fake_bin / "python3.12"
+    fake_312.write_text(
+        "#!/bin/bash\n"
+        "# The version probe passes; any other invocation reports its argv.\n"
+        'if [ "$1" = "-c" ]; then exit 0; fi\n'
+        'echo "ran $*"\n'
+    )
+    fake_312.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))
+    proc = run_shim(["-q"])
+    assert proc.returncode == 0
+    # dirname is absent from the stripped PATH, so the shim falls back to the
+    # working directory for SCRIPT_DIR - the same fallback the oc test above
+    # relies on.
+    assert proc.stdout.strip() == f"ran {Path.cwd() / 'ocp_idle_check.py'} -q"

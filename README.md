@@ -168,6 +168,10 @@ fi
 - `python3` (3.12+; standard library only, no pip installs)
 - Prometheus/Thanos - for time-windowed metrics
 
+The entrypoint shim looks for `python3.12` first and falls back to the bare
+`python3` name.  This matters on the Jenkins agent image, where the bare
+`python3` is 3.9 while `/usr/bin/python3.12` is installed alongside it.
+
 For development (tests, linting) use [uv](https://docs.astral.sh/uv/):
 
 ```bash
