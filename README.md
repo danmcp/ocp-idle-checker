@@ -35,7 +35,7 @@ Each criterion is evaluated independently and can be `IDLE`, `ACTIVE`, `UNKNOWN`
 | **Memory** | the time-windowed average ≥ 35%, or an instant snapshot ≥ 35% (one-directional override) |
 | **API Server** | the time-windowed average ≥ 100 req/sec, or any 15-minute window > 2× the median window while above 50 req/s |
 | **GPU** | any 15-minute window > 40%, or the window peak > 2× the median window (DCGM GPU utilization) |
-| **Operators** | the oldest operator pod is < 7 days old, or ≥ 5 recent reconciliation events |
+| **Operators** | the median controller age is < 7 days, or ≥ 5 reconciliation events in the last 48 hours |
 
 A criterion votes IDLE when none of its ACTIVE conditions hold. Some criteria can instead be N/A — not counted in the denominator (see [Conditional Criteria](#conditional-criteria)).
 
@@ -53,6 +53,14 @@ CPU falls back to the legacy window-average rule when the range matrix is unavai
 ### Spike Detection (API Server)
 
 The API server criterion keeps the legacy window-average threshold (100 req/sec) and adds a second detector: any 15-minute window above 2× the median window (and above a floor of 50 req/s) also counts as ACTIVE.
+
+### Operators
+
+The scan is cluster-wide: every namespace counts except those matching the excluded prefixes (`openshift-`, `kube-`, `open-cluster-management-` — the platform's own controllers), and `--operator-namespaces` acts as an always-include override for namespaces that would otherwise be excluded. A controller is any pod whose name matches `controller-manager|operator|dashboard`.
+
+Each controller is aged by its **ReplicaSet**, not its pod: a node drain recreates pods without meaning the operator was reinstalled, so the ReplicaSet's creation timestamp — which only moves on a real rollout — is joined via the pod's owner references. Pods without a ReplicaSet owner (or whose ReplicaSet has been deleted mid-rollout) fall back to their own pod age.
+
+The criterion votes on the **median** age across controllers, so one stale survivor cannot mask a fleet-wide reinstall and one fresh restart cannot mark a quiet cluster active. Reconciliation activity is counted over a 48-hour window; events about workload objects (pods, replica sets, deployments, and the like — the noise a churning workload or a node drain manufactures) are excluded from that count and exported separately as `events_excluded_workload` for calibration.
 
 ### Instant Override (Memory)
 
@@ -72,7 +80,7 @@ Some criteria are **skipped** (not counted in the total) when the required data 
 
 - **API Server**: skipped if both the windowed average and the spike detector have no data
 - **GPU**: skipped on clusters without GPU nodes or without DCGM metrics
-- **Operators**: skipped if none of the configured namespaces exist on the cluster
+- **Operators**: skipped when no controller pods are found in any scanned namespace
 
 CPU and memory `UNKNOWN` still count toward the denominator (they never help the IDLE count, only the total).
 
@@ -85,7 +93,9 @@ CPU and memory `UNKNOWN` still count toward the denominator (they never help the
 | `-m, --mem-threshold N` | Memory idle threshold (%) | 35 |
 | `-a, --api-threshold N` | API requests/sec threshold | 100 |
 | `-o, --operator-age N` | Operator age threshold (days) | 7 |
-| `--operator-namespaces NS` | Operator namespaces to check | opendatahub,redhat-ods-operator,redhat-ods-applications |
+| `--operator-namespaces NS` | Namespaces always included in the operator scan (the scan covers every namespace except the excluded prefixes) | opendatahub,redhat-ods-operator,redhat-ods-applications |
+| `--operator-exclude-prefixes PREFIX,...` | Namespace prefixes excluded from the operator scan | openshift-,kube-,open-cluster-management- |
+| `--operator-event-hours HOURS` | Reconciliation event window for the operators criterion | 48 |
 | `--cpu-peak-threshold N` | CPU: any 15-min window above this % = ACTIVE | 40 |
 | `--cpu-shape-ratio N` | CPU: peak/median above this = ACTIVE | 2 |
 | `--gpu-peak-threshold N` | GPU: any 15-min window above this % = ACTIVE | 40 |

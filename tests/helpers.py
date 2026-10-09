@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timedelta
 
 import ocp_idle_check as oic
 
@@ -65,6 +66,8 @@ def base_config(**overrides) -> oic.Config:
         api_threshold=100.0,
         operator_age_days=7,
         operator_namespaces="opendatahub,redhat-ods-operator,redhat-ods-applications",
+        operator_exclude_prefixes="openshift-,kube-,open-cluster-management-",
+        operator_event_hours=48,
         event_history_minutes=60,
         check_ml_nodes=True,
         ml_node_pattern="p5|p4d|g5",
@@ -89,26 +92,66 @@ class FakeOc:
 
     def __init__(
         self,
-        existing: set[str] | None = None,
-        pods: dict[str, list[str]] | None = None,
-        events: dict[str, list[str]] | None = None,
+        pods: list[str] | None = None,
+        replicasets: list[str] | None = None,
+        events: list[str] | None = None,
     ) -> None:
-        self.existing = existing or set()
-        self.pods = pods or {}
-        self.events = events or {}
-        self.calls: list[tuple[str, str]] = []
+        self.pod_rows = pods or []
+        self.rs_rows = replicasets or []
+        self.event_rows = events or []
+        self.calls: list[str] = []
 
-    def namespace_exists(self, namespace: str) -> bool:
-        self.calls.append(("namespace", namespace))
-        return namespace in self.existing
+    def pods_all(self) -> list[str]:
+        self.calls.append("pods")
+        return self.pod_rows
 
-    def pods_in(self, namespace: str) -> list[str]:
-        self.calls.append(("pods", namespace))
-        return self.pods.get(namespace, [])
+    def replicasets_all(self) -> list[str]:
+        self.calls.append("replicasets")
+        return self.rs_rows
 
-    def events_in(self, namespace: str) -> list[str]:
-        self.calls.append(("events", namespace))
-        return self.events.get(namespace, [])
+    def events_all_rows(self) -> list[str]:
+        self.calls.append("events")
+        return self.event_rows
+
+
+# Row builders mirroring the module's jsonpath shapes (PODS_ALL_JSONPATH,
+# REPLICASETS_ALL_JSONPATH, EVENTS_ALL_JSONPATH); tests key their FakeOc
+# data on these so a changed column order fails loudly instead of silently
+# producing garbage ages.
+
+
+def ts_before(now: datetime, **delta) -> str:
+    """A Kubernetes timestamp `delta` (days=..., hours=...) before `now`."""
+    return (now - timedelta(**delta)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def pod_row(
+    namespace: str, pod: str, owner_kind: str = "", owner_name: str = "", created: str = ""
+) -> str:
+    """One `oc get pods -A` row: namespace, pod, owner kind, owner name, created."""
+    return f"{namespace}\t{pod}\t{owner_kind}\t{owner_name}\t{created}"
+
+
+def rs_row(namespace: str, name: str, created: str) -> str:
+    """One `oc get rs -A` row: namespace, name, created."""
+    return f"{namespace}\t{name}\t{created}"
+
+
+def event_row(
+    namespace: str,
+    *,
+    now: datetime,
+    hours: float = 1.0,
+    type_: str = "Normal",
+    reason: str = "Pulled",
+    kind: str = "Pod",
+    involved: str = "odh-xyz",
+    message: str = "quiet",
+    timestamp: str | None = None,
+) -> str:
+    """One `oc get events -A` row; `timestamp=""` yields no timestamps."""
+    ts = timestamp if timestamp is not None else ts_before(now, hours=hours)
+    return f"{namespace}\t{type_}\t{reason}\t{kind}\t{involved}\t{message}\t{ts}\t{ts}"
 
 
 # Expected query strings, mirroring the f-strings the module builds.  Tests

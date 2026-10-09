@@ -15,6 +15,8 @@ def test_defaults():
     assert cfg.api_threshold == 100.0
     assert cfg.operator_age_days == 7
     assert cfg.operator_namespaces == oic.OPERATOR_NAMESPACES
+    assert cfg.operator_exclude_prefixes == oic.OPERATOR_EXCLUDE_PREFIXES
+    assert cfg.operator_event_hours == oic.OPERATOR_EVENT_WINDOW_HOURS
     assert cfg.verbose is True
     assert cfg.check_ml_nodes is True
     assert cfg.debug_probe is False

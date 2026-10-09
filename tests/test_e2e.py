@@ -14,18 +14,23 @@ import json
 import shutil
 import subprocess
 import sys
+from datetime import UTC, datetime
 from pathlib import Path
 
 import ocp_idle_check as oic
 from helpers import (
     api_avg_query,
+    event_row,
     make_dcgm_series,
     make_range_series,
     memory_window_query,
     node_cpu_window_query,
     node_mem_window_query,
+    pod_row,
     prom_instant_json,
     prom_range_json,
+    rs_row,
+    ts_before,
 )
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -35,9 +40,48 @@ BASH = shutil.which("bash") or "/bin/bash"
 SERVER = "https://api.test-cluster.example.com:6443"
 WINDOW = 10080
 
-OPERATOR_POD_OLD = "odh-operator-controller-manager-abc 1/1 Running 5 (3d ago) 12d"
-OPERATOR_POD_YOUNG = "odh-operator-controller-manager-abc 1/1 Running 0 2d"
-QUIET_EVENT = "5m Normal Pulled pod/odh-xyz Pulled image quay.io/example"
+# Timestamps are taken at import time: the criteria round ages to two
+# decimals, so the sub-second gap to run() never moves a rounded age.
+E2E_NOW = datetime.now(UTC)
+OPERATOR_PODS_OLD = (
+    pod_row(
+        "opendatahub",
+        "odh-operator-controller-manager-abc",
+        "ReplicaSet",
+        "odh-operator-5d4c3b",
+        ts_before(E2E_NOW, days=12),
+    )
+    + "\n"
+)
+OPERATOR_REPLICASETS_OLD = (
+    rs_row("opendatahub", "odh-operator-5d4c3b", ts_before(E2E_NOW, days=12)) + "\n"
+)
+# Young variant: a rollout two days ago left a new owner reference behind.
+OPERATOR_PODS_YOUNG = (
+    pod_row(
+        "opendatahub",
+        "odh-operator-controller-manager-abc",
+        "ReplicaSet",
+        "odh-operator-9f8e7d",
+        ts_before(E2E_NOW, days=2),
+    )
+    + "\n"
+)
+OPERATOR_REPLICASETS_YOUNG = (
+    rs_row("opendatahub", "odh-operator-9f8e7d", ts_before(E2E_NOW, days=2)) + "\n"
+)
+QUIET_EVENTS = (
+    event_row(
+        "opendatahub",
+        now=E2E_NOW,
+        hours=1,
+        reason="Pulled",
+        kind="Pod",
+        involved="odh-xyz",
+        message="Pull image quay.io/example",
+    )
+    + "\n"
+)
 CREATE_TOKEN_ARGS = (
     "create",
     "token",
@@ -91,17 +135,9 @@ def base_oc_responses(nodes: list[dict]) -> dict[tuple[str, ...], str | None]:
         ("whoami", "-t"): "fake-token",
         ("get", "nodes", "-o", "json"): json.dumps({"items": nodes}),
         ("adm", "top", "nodes", "--no-headers"): top_lines,
-        ("get", "namespace", "opendatahub"): "",
-        ("get", "namespace", "redhat-ods-operator"): None,
-        ("get", "namespace", "redhat-ods-applications"): None,
-        ("get", "pods", "-n", "opendatahub", "--no-headers"): OPERATOR_POD_OLD + "\n",
-        (
-            "get",
-            "events",
-            "-n",
-            "opendatahub",
-            "--sort-by=.lastTimestamp",
-        ): QUIET_EVENT + "\n",
+        ("get", "pods", "-A", "-o", oic.PODS_ALL_JSONPATH): OPERATOR_PODS_OLD,
+        ("get", "rs", "-A", "-o", oic.REPLICASETS_ALL_JSONPATH): OPERATOR_REPLICASETS_OLD,
+        ("get", "events", "-A", "-o", oic.EVENTS_ALL_JSONPATH): QUIET_EVENTS,
     }
 
 
@@ -128,8 +164,8 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
     oc_responses = base_oc_responses(
         [node_item("node-1"), node_item("node-2"), node_item("node-3")]
     )
-    # Verbose mode also pulls the cluster-wide event list and machine list.
-    oc_responses[("get", "events", "-A", "--sort-by=.lastTimestamp")] = ""
+    # Verbose mode also pulls the machine list; the cluster-wide event list
+    # is shared with the operators criterion through the Oc cache.
     oc_responses[("get", "machines", "-n", "openshift-machine-api", "-o", "json")] = '{"items": []}'
     calls = install_fake_oc(monkeypatch, oc_responses)
     quiet_cpu(responses, ["node-1", "node-2", "node-3"])
@@ -169,6 +205,8 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
         "memory_threshold",
         "api_threshold",
         "operator_age_threshold_days",
+        "operator_event_window_hours",
+        "operator_exclude_prefixes",
         "cpu_peak_threshold",
         "cpu_shape_ratio",
         "gpu_peak_threshold",
@@ -191,7 +229,7 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
     assert criteria["cpu"]["result"] == "IDLE"
     assert criteria["cpu"]["source"] == "spike/shape over 15m windows"
     assert criteria["cpu"]["peak"] == 2.0
-    assert criteria["operators"]["age_days"] == 12
+    assert criteria["operators"]["age_days"] == 12.0
     assert criteria["operators"]["events"] == 0
     assert criteria["gpu"]["result"] == "N/A"
     # The token came from `oc whoami -t`; no service-account token was created.
@@ -204,7 +242,10 @@ def test_active_cluster_quiet(monkeypatch, prom_server, tmp_path, capsys):
     oc_responses = base_oc_responses(
         [node_item("node-1"), node_item("node-2"), node_item("node-3")]
     )
-    oc_responses[("get", "pods", "-n", "opendatahub", "--no-headers")] = OPERATOR_POD_YOUNG + "\n"
+    oc_responses[("get", "pods", "-A", "-o", oic.PODS_ALL_JSONPATH)] = OPERATOR_PODS_YOUNG
+    oc_responses[("get", "rs", "-A", "-o", oic.REPLICASETS_ALL_JSONPATH)] = (
+        OPERATOR_REPLICASETS_YOUNG
+    )
     install_fake_oc(monkeypatch, oc_responses)
     # One node spends a single 15-minute window at 50% CPU.
     responses[("/api/v1/query_range", oic.CPU_RANGE_QUERY)] = prom_range_json(
@@ -235,7 +276,10 @@ def test_gpu_cluster_adds_fifth_criterion(monkeypatch, prom_server, tmp_path):
     monkeypatch.setenv("OCP_IDLE_PROMETHEUS_URL", url)
     nodes = [node_item("node-1"), node_item("gpu-node-1", instance_type="g5.xlarge", gpus="4")]
     oc_responses = base_oc_responses(nodes)
-    oc_responses[("get", "pods", "-n", "opendatahub", "--no-headers")] = OPERATOR_POD_YOUNG + "\n"
+    oc_responses[("get", "pods", "-A", "-o", oic.PODS_ALL_JSONPATH)] = OPERATOR_PODS_YOUNG
+    oc_responses[("get", "rs", "-A", "-o", oic.REPLICASETS_ALL_JSONPATH)] = (
+        OPERATOR_REPLICASETS_YOUNG
+    )
     oc_responses[("adm", "top", "node", "gpu-node-1", "--no-headers")] = (
         "gpu-node-1 500m 3% 8000Mi 6%\n"
     )

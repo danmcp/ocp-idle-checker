@@ -7,18 +7,24 @@ oc CLI is stubbed with FakeOc for the operators criterion.
 
 from __future__ import annotations
 
+from datetime import UTC, datetime
+
 import ocp_idle_check as oic
 from helpers import (
     FakeOc,
     FakeProm,
     api_avg_query,
     base_config,
+    event_row,
     gpu_avg_query,
     gpu_max_query,
     legacy_cpu_query,
     make_dcgm_series,
     make_range_series,
     memory_window_query,
+    pod_row,
+    rs_row,
+    ts_before,
 )
 
 WINDOW = 10080
@@ -396,117 +402,316 @@ def test_gpu_na_without_dcgm_metrics():
 
 # === OPERATORS ==============================================================
 
+# Fixed clock for the operator tests: ages are exact and the event window
+# boundaries are testable at 47/49 hours.
+NOW = datetime(2026, 10, 9, 12, 0, 0, tzinfo=UTC)
 
-OPERATOR_POD_OLD = "odh-operator-controller-manager-abc 1/1 Running 0 12d"
-OPERATOR_POD_RESTARTED = "odh-operator-controller-manager-abc 1/1 Running 5 (3d ago) 12d"
-QUIET_EVENT = "5m Normal Pulled pod/odh-xyz Pulled image quay.io/example"
-MATCHING_EVENT = "5m Normal Scheduled pod/odh-xyz reconciled successfully"
+RS_KEY = ("opendatahub", "odh-operator-controller-manager-abc", "odh-operator-5d4c3b")
+
+
+def old_operator_pod(namespace: str = "opendatahub") -> str:
+    return pod_row(*RS_KEY[:2], "ReplicaSet", RS_KEY[2], ts_before(NOW, days=12))
+
+
+def old_operator_rs() -> str:
+    return rs_row(RS_KEY[0], RS_KEY[2], ts_before(NOW, days=12))
+
+
+def reconciled_event(
+    namespace: str = "opendatahub", hours: float = 1.0, timestamp: str | None = None
+) -> str:
+    return event_row(
+        namespace,
+        now=NOW,
+        hours=hours,
+        timestamp=timestamp,
+        reason="Reconciled",
+        kind="DataScienceCluster",
+        involved="dsc-sample",
+        message="reconciliation complete",
+    )
 
 
 def test_operators_old_and_quiet_is_idle():
-    oc = FakeOc(
-        existing={"opendatahub"},
-        pods={"opendatahub": [OPERATOR_POD_OLD]},
-        events={"opendatahub": [MATCHING_EVENT, MATCHING_EVENT]},
-    )
-    outcome = oic.check_operators(base_config(), oc)
+    oc = FakeOc(pods=[old_operator_pod()], replicasets=[old_operator_rs()], events=[])
+    outcome = oic.check_operators(base_config(), oc, now=NOW)
     assert outcome.result == "IDLE"
     assert outcome.counted
-    assert outcome.entry["age_days"] == 12
-    assert outcome.entry["events"] == 2  # below the threshold of 5
+    assert outcome.entry["age_days"] == 12.0
+    assert outcome.entry["events"] == 0  # below the threshold of 5
     assert outcome.entry["namespaces"] == ["opendatahub"]
+    assert outcome.entry["event_window_hours"] == 48
+    assert outcome.entry["units"] == [
+        {
+            "namespace": "opendatahub",
+            "kind": "replicaset",
+            "name": "odh-operator-5d4c3b",
+            "age_days": 12.0,
+        }
+    ]
+    assert oc.calls == ["pods", "replicasets", "events"]
 
 
-def test_operators_age_reads_last_field_despite_restart_annotation():
-    # oc renders RESTARTS as "5 (3d ago)" on restarted pods, shifting AGE
-    # out of the fixed column the bash script read.  The age must come from
-    # the LAST field: 12d, not "ago" or "3d".
+def test_operators_young_controllers_mark_active():
+    pod = pod_row(*RS_KEY[:2], "ReplicaSet", RS_KEY[2], ts_before(NOW, days=2))
+    rs = rs_row(RS_KEY[0], RS_KEY[2], ts_before(NOW, days=2))
+    outcome = oic.check_operators(base_config(), FakeOc(pods=[pod], replicasets=[rs]), now=NOW)
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["age_days"] == 2.0
+
+
+def test_operators_median_young_majority_is_active():
+    # Two of three controllers redeployed two days ago; one stale survivor
+    # is 40 days old.  The old oldest-pod rule called this IDLE.
+    pods = [
+        pod_row(
+            "ns-a",
+            f"{name}-controller-manager",
+            "ReplicaSet",
+            f"{name}-rs",
+            ts_before(NOW, days=age),
+        )
+        for name, age in (("a", 2), ("b", 2), ("c", 40))
+    ]
+    outcome = oic.check_operators(base_config(), FakeOc(pods=pods), now=NOW)
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["age_days"] == 2.0
+
+
+def test_operators_median_old_majority_stays_idle():
+    # One fresh unit among old ones: a single recent restart must not mark
+    # the cluster active.  Ages 30, 30, 1 -> median 30.
+    pods = [
+        pod_row(
+            "ns-a",
+            f"{name}-controller-manager",
+            "ReplicaSet",
+            f"{name}-rs",
+            ts_before(NOW, days=age),
+        )
+        for name, age in (("a", 30), ("b", 30), ("c", 1))
+    ]
+    outcome = oic.check_operators(base_config(), FakeOc(pods=pods), now=NOW)
+    assert outcome.result == "IDLE"
+    assert outcome.entry["age_days"] == 30.0
+
+
+def test_operators_even_sample_averages_the_middle_ages():
+    # Ages 2, 2, 30, 30: the median is 16, above the threshold even though
+    # half the stack is fresh.
+    pods = [
+        pod_row(
+            "ns-a",
+            f"{name}-controller-manager",
+            "ReplicaSet",
+            f"{name}-rs",
+            ts_before(NOW, days=age),
+        )
+        for name, age in (("a", 2), ("b", 2), ("c", 30), ("d", 30))
+    ]
+    outcome = oic.check_operators(base_config(), FakeOc(pods=pods), now=NOW)
+    assert outcome.result == "IDLE"
+    assert outcome.entry["age_days"] == 16.0
+
+
+def test_operators_replicaset_age_survives_drain():
+    # The ReplicaSet is 30 days old but its pod was recreated yesterday by
+    # a node drain: the unit's age is the ReplicaSet's, not the pod's.
+    pod = pod_row(*RS_KEY[:2], "ReplicaSet", RS_KEY[2], ts_before(NOW, days=1))
+    rs = rs_row(RS_KEY[0], RS_KEY[2], ts_before(NOW, days=30))
+    outcome = oic.check_operators(base_config(), FakeOc(pods=[pod], replicasets=[rs]), now=NOW)
+    assert outcome.result == "IDLE"
+    assert outcome.entry["age_days"] == 30.0
+
+
+def test_operators_bare_pod_falls_back_to_pod_age():
+    # A controller pod with no owner references is aged by its own creation
+    # time; no ReplicaSet listing is needed for it.
     oc = FakeOc(
-        existing={"opendatahub"},
-        pods={"opendatahub": [OPERATOR_POD_RESTARTED]},
-        events={"opendatahub": []},
+        pods=[pod_row("team-a", "standalone-operator", "", "", ts_before(NOW, days=2))], events=[]
     )
-    outcome = oic.check_operators(base_config(), oc)
-    assert outcome.entry["age_days"] == 12
+    outcome = oic.check_operators(base_config(), oc, now=NOW)
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["age_days"] == 2.0
+    assert oc.calls == ["pods", "events"]
+
+
+def test_operators_missing_replicaset_falls_back_to_pod_age():
+    # A ReplicaSet deleted mid-rollout leaves its pods behind; the oldest
+    # replica's age stands in, and unrelated ReplicaSets (here: an old
+    # scaled-to-zero revision) are not read.
+    pods = [
+        pod_row(
+            RS_KEY[0],
+            f"odh-operator-controller-manager-{sfx}",
+            "ReplicaSet",
+            "odh-operator-gone",
+            ts_before(NOW, days=age),
+        )
+        for sfx, age in (("abc", 30), ("def", 1))
+    ]
+    rs = rs_row(RS_KEY[0], "unrelated-old-revision", ts_before(NOW, days=5))
+    outcome = oic.check_operators(base_config(), FakeOc(pods=pods, replicasets=[rs]), now=NOW)
+    assert outcome.result == "IDLE"
+    assert outcome.entry["age_days"] == 30.0
+
+
+def test_operators_dedupes_replicas_of_one_replicaset():
+    # Three replicas of one ReplicaSet are a single unit; the median must
+    # not be skewed by replica count.
+    pods = [
+        pod_row(
+            RS_KEY[0],
+            f"odh-operator-controller-manager-{sfx}",
+            "ReplicaSet",
+            RS_KEY[2],
+            ts_before(NOW, days=12),
+        )
+        for sfx in ("abc", "def", "ghi")
+    ]
+    outcome = oic.check_operators(
+        base_config(), FakeOc(pods=pods, replicasets=[old_operator_rs()]), now=NOW
+    )
+    assert len(outcome.entry["units"]) == 1
+    assert outcome.entry["age_days"] == 12.0
+
+
+def test_operators_event_window_is_48_hours():
+    # 47 hours old counts, 49 does not, and an event with no timestamps at
+    # all is treated as outside the window.
+    events = [
+        reconciled_event(hours=47),
+        reconciled_event(hours=49),
+        reconciled_event(timestamp=""),
+    ]
+    outcome = oic.check_operators(
+        base_config(), FakeOc(pods=[old_operator_pod()], events=events), now=NOW
+    )
+    assert outcome.entry["events"] == 1
+    assert outcome.result == "IDLE"
 
 
 def test_operators_recent_events_mark_active():
-    oc = FakeOc(
-        existing={"opendatahub"},
-        pods={"opendatahub": [OPERATOR_POD_OLD]},
-        events={"opendatahub": [MATCHING_EVENT] * 5},
+    events = [reconciled_event(hours=1) for _ in range(5)]
+    outcome = oic.check_operators(
+        base_config(), FakeOc(pods=[old_operator_pod()], events=events), now=NOW
     )
-    outcome = oic.check_operators(base_config(), oc)
     assert outcome.result == "ACTIVE"
     assert outcome.entry["events"] == 5
 
 
-def test_operators_young_pods_mark_active():
-    oc = FakeOc(
-        existing={"opendatahub"},
-        pods={"opendatahub": ["odh-operator-controller-manager-abc 1/1 Running 0 2d"]},
-        events={"opendatahub": []},
+def test_operators_workload_lifecycle_events_are_excluded():
+    # Events about pods, replica sets, and deployments are the noise a node
+    # drain manufactures; they match the regex but must not count toward
+    # the threshold.  The excluded tally is exported for calibration.
+    events = [
+        event_row(
+            "opendatahub", now=NOW, reason="Created", kind="Pod", message="Created pod odh-xyz"
+        ),
+        event_row(
+            "opendatahub",
+            now=NOW,
+            reason="SuccessfulCreate",
+            kind="ReplicaSet",
+            message="created pod odh-xyz-abc",
+        ),
+        event_row(
+            "opendatahub",
+            now=NOW,
+            reason="ScalingReplicaSet",
+            kind="Deployment",
+            message="scaled up replica set odh-xyz",
+        ),
+        reconciled_event(),
+    ]
+    outcome = oic.check_operators(
+        base_config(), FakeOc(pods=[old_operator_pod()], events=events), now=NOW
     )
-    outcome = oic.check_operators(base_config(), oc)
-    assert outcome.result == "ACTIVE"
-    assert outcome.entry["age_days"] == 2
+    assert outcome.result == "IDLE"
+    assert outcome.entry["events"] == 1
+    assert outcome.entry["events_excluded_workload"] == 3
 
 
-def test_operators_na_when_no_namespaces_hold_pods():
-    oc = FakeOc(existing=set(), pods={}, events={})
-    outcome = oic.check_operators(base_config(), oc)
+def test_operators_platform_namespaces_are_ignored():
+    # openshift-* and kube-* hold the platform's own controllers, whose
+    # pods and events would swamp the criterion.
+    oc = FakeOc(
+        pods=[
+            pod_row(
+                "openshift-operators",
+                "cluster-automation-operator-abc",
+                "ReplicaSet",
+                "cao-rs",
+                ts_before(NOW, days=1),
+            ),
+            pod_row("kube-system", "some-operator-xyz", "", "", ts_before(NOW, days=1)),
+        ],
+        events=[reconciled_event("openshift-ingress-operator")],
+    )
+    outcome = oic.check_operators(base_config(), oc, now=NOW)
     assert outcome.result == "N/A"
     assert not outcome.counted
-    # Only namespace lookups happened; no pod or event listings.
-    assert [kind for kind, _ in oc.calls] == ["namespace"] * 3
+    assert outcome.entry["reason"] == "no controller pods in any scanned namespace"
 
 
-def test_operators_events_counted_from_podless_namespaces():
-    # Events are summed over every EXISTING namespace, including ones with
-    # no matching operator pods (bash parity).
-    oc = FakeOc(
-        existing={"opendatahub", "redhat-ods-applications"},
-        pods={"opendatahub": [OPERATOR_POD_OLD]},
-        events={
-            "opendatahub": [MATCHING_EVENT] * 2,
-            "redhat-ods-applications": [MATCHING_EVENT] * 3,
-        },
+def test_operators_configured_namespaces_override_the_exclusions():
+    # A namespace on the always-include list counts even when it matches an
+    # excluded prefix (an ODH install inside openshift-*, say).
+    cfg = base_config(operator_namespaces="openshift-odh-custom")
+    pod = pod_row(
+        "openshift-odh-custom", "my-operator-1", "ReplicaSet", "my-rs", ts_before(NOW, days=12)
     )
-    outcome = oic.check_operators(base_config(), oc)
+    outcome = oic.check_operators(cfg, FakeOc(pods=[pod]), now=NOW)
+    assert outcome.result == "IDLE"
+    assert outcome.entry["namespaces"] == ["openshift-odh-custom"]
+
+
+def test_operators_na_makes_no_further_oc_calls():
+    oc = FakeOc(pods=[], events=[])
+    outcome = oic.check_operators(base_config(), oc, now=NOW)
+    assert outcome.result == "N/A"
+    assert not outcome.counted
+    # The pod listing alone rules out the criterion; no ReplicaSet or event
+    # listings follow.
+    assert oc.calls == ["pods"]
+
+
+def test_operators_scans_beyond_the_configured_namespaces():
+    # Controllers running in user namespaces - strimzi, prometheus-operator,
+    # istio - are operator activity too; the scan covers them.
+    pod = pod_row(
+        "team-a", "strimzi-cluster-operator-abc", "ReplicaSet", "strimzi-rs", ts_before(NOW, days=1)
+    )
+    outcome = oic.check_operators(base_config(), FakeOc(pods=[pod]), now=NOW)
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["namespaces"] == ["team-a"]
+
+
+def test_operators_events_sum_across_scanned_namespaces():
+    # Events count from every scanned namespace, not just the ones holding
+    # matching pods; strimzi reconciles Kafka custom resources, not pods.
+    events = [reconciled_event() for _ in range(2)]
+    events += [
+        event_row(
+            "team-a",
+            now=NOW,
+            reason="Reconciled",
+            kind="Kafka",
+            involved="my-cluster",
+            message="reconciliation complete",
+        )
+        for _ in range(3)
+    ]
+    outcome = oic.check_operators(
+        base_config(), FakeOc(pods=[old_operator_pod()], events=events), now=NOW
+    )
     assert outcome.result == "ACTIVE"
     assert outcome.entry["events"] == 5
-    assert ("events", "redhat-ods-applications") in oc.calls
 
 
-def test_operators_only_first_five_pods_per_namespace():
-    # Bash parity: only the first five matching pods per namespace count.
-    pods = [
-        f"odh-operator-{i}-controller-manager 1/1 Running 0 {age}"
-        for i, age in enumerate(["1d", "2d", "3d", "4d", "5d", "30d"])
-    ]
-    oc = FakeOc(existing={"opendatahub"}, pods={"opendatahub": pods}, events={"opendatahub": []})
-    outcome = oic.check_operators(base_config(), oc)
-    assert outcome.entry["age_days"] == 5  # the 30d pod is sixth and ignored
-    assert outcome.result == "ACTIVE"
-
-
-def test_operators_only_last_twenty_events_count():
-    # oc sorts by lastTimestamp; only the most recent 20 events are read.
-    # The matching lines sit oldest (first), beyond the 20-line window.
-    events = [MATCHING_EVENT] * 5 + [QUIET_EVENT] * 20
-    oc = FakeOc(
-        existing={"opendatahub"},
-        pods={"opendatahub": [OPERATOR_POD_OLD]},
-        events={"opendatahub": events},
-    )
-    outcome = oic.check_operators(base_config(), oc)
-    assert outcome.entry["events"] == 0
-    assert outcome.result == "IDLE"
-
-
-def test_convert_age_to_days():
-    assert oic.convert_age_to_days("12d") == 12
-    assert oic.convert_age_to_days("2d7h") == 2
-    assert oic.convert_age_to_days("5h") == 0
-    assert oic.convert_age_to_days("30m") == 0
-    assert oic.convert_age_to_days("10s") == 0
+def test_parse_k8s_timestamp():
+    assert oic.parse_k8s_timestamp("2026-10-01T12:00:00Z") == datetime(2026, 10, 1, 12, tzinfo=UTC)
+    assert oic.parse_k8s_timestamp("") is None
+    assert oic.parse_k8s_timestamp("not-a-timestamp") is None
+    # Naive values are read as UTC, never left to poison the arithmetic.
+    assert oic.parse_k8s_timestamp("2026-10-01T12:00:00") == datetime(2026, 10, 1, 12, tzinfo=UTC)

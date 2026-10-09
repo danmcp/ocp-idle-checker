@@ -92,7 +92,22 @@ def sample_report() -> dict:
             "memory": {"result": "IDLE", "value": "10.00"},
             "api_server": {"result": "IDLE", "value": "5.00"},
             "gpu": {"result": "N/A", "value": None},
-            "operators": {"result": "IDLE", "age_days": 12},
+            "operators": {
+                "result": "IDLE",
+                "age_days": 12.0,
+                "units": [
+                    {
+                        "namespace": "opendatahub",
+                        "kind": "replicaset",
+                        "name": "odh-operator-5d4c3b",
+                        "age_days": 12.0,
+                    }
+                ],
+                "namespaces": ["opendatahub"],
+                "events": 0,
+                "events_excluded_workload": 0,
+                "event_window_hours": 48,
+            },
         },
         "gpu": {
             "has_gpu_nodes": False,
@@ -150,3 +165,6 @@ def test_base_config_matches_shipped_defaults():
     assert cfg.time_window_minutes == oic.DEFAULT_TIME_WINDOW_MINUTES
     assert cfg.cpu_peak_threshold == oic.CPU_PEAK_THRESHOLD
     assert cfg.api_spike_floor == oic.API_SPIKE_FLOOR
+    assert cfg.operator_namespaces == oic.OPERATOR_NAMESPACES
+    assert cfg.operator_exclude_prefixes == oic.OPERATOR_EXCLUDE_PREFIXES
+    assert cfg.operator_event_hours == oic.OPERATOR_EVENT_WINDOW_HOURS

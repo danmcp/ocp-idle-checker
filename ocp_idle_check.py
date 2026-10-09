@@ -25,9 +25,13 @@ A cluster is IDLE when at least 80% of the applicable criteria vote IDLE:
   gpu        the same spike/shape rule as cpu, on DCGM GPU utilization
              (DCGM_FI_DEV_GPU_UTIL).  N/A (not counted) on clusters without
              GPU nodes or without DCGM metrics.
-  operators  legacy rule: oldest operator pod age and recent reconciliation
-             events in the configured namespaces.  N/A (not counted) when no
-             configured namespace holds operator pods.
+  operators  controller age and reconciliation events across all non-platform
+             namespaces: ACTIVE when the median controller is younger than
+             the age threshold (controllers are aged by their ReplicaSet,
+             so a node drain does not reset the clock) or when
+             reconciliation events inside the event window reach the
+             threshold.  N/A (not counted) when no controller pods exist
+             anywhere on the cluster.
 
 The spike/shape parameters (peak threshold, ratio; the API spike rule also
 has an absolute floor) are fleet calibration knobs exposed as command-line
@@ -61,7 +65,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -77,7 +81,9 @@ MEMORY_IDLE_THRESHOLD = 35.0  # percent
 APISERVER_IDLE_THRESHOLD = 100.0  # requests/sec
 OPERATOR_IDLE_AGE_DAYS = 7
 OPERATOR_NAMESPACES = "opendatahub,redhat-ods-operator,redhat-ods-applications"
-OPERATOR_EVENT_THRESHOLD = 5  # recent reconciliation events
+OPERATOR_EXCLUDE_PREFIXES = "openshift-,kube-,open-cluster-management-"
+OPERATOR_EVENT_THRESHOLD = 5  # reconciliation events within the window
+OPERATOR_EVENT_WINDOW_HOURS = 48
 EVENT_TIME_MINUTES = 60
 ML_NODE_PATTERN = "p5|p4d|g5"
 
@@ -112,7 +118,32 @@ API_RANGE_QUERY = f"sum(rate(apiserver_request_total[{SPIKE_WINDOW_MINUTES}m]))"
 POD_RE = re.compile(r"controller-manager|operator|dashboard")
 OPERATOR_EVENT_RE = re.compile(r"reconcil|created|updated|scaled", re.IGNORECASE)
 RECENT_ACTIVITY_RE = re.compile(r"Pod|Deployment|ReplicaSet|Job")
-AGE_RE = re.compile(r"^([0-9]+)d")
+
+# Events about workload machinery (a pod being scheduled, a replica set
+# scaling) are the noise a node drain manufactures by the dozen; the age
+# half of the operators rule already treats drains as non-events, so the
+# event half must not count them either.
+OPERATOR_WORKLOAD_KINDS = frozenset(
+    {"Pod", "ReplicaSet", "Deployment", "DaemonSet", "StatefulSet", "Job", "CronJob", "Node"}
+)
+
+# Cluster-wide listings for the operators criterion, fetched as jsonpath
+# with explicit tab separators: custom-columns collapses empty fields into
+# space runs, which would shift the positional fields of a bare-pod row.
+PODS_ALL_JSONPATH = (
+    'jsonpath={range .items[*]}{.metadata.namespace}{"\\t"}{.metadata.name}{"\\t"}'
+    '{.metadata.ownerReferences[0].kind}{"\\t"}{.metadata.ownerReferences[0].name}{"\\t"}'
+    '{.metadata.creationTimestamp}{"\\n"}{end}'
+)
+REPLICASETS_ALL_JSONPATH = (
+    'jsonpath={range .items[*]}{.metadata.namespace}{"\\t"}{.metadata.name}{"\\t"}'
+    '{.metadata.creationTimestamp}{"\\n"}{end}'
+)
+EVENTS_ALL_JSONPATH = (
+    'jsonpath={range .items[*]}{.metadata.namespace}{"\\t"}{.type}{"\\t"}{.reason}{"\\t"}'
+    '{.involvedObject.kind}{"\\t"}{.involvedObject.name}{"\\t"}{.message}{"\\t"}'
+    '{.lastTimestamp}{"\\t"}{.firstTimestamp}{"\\n"}{end}'
+)
 
 _UNVERIFIED_CTX = ssl.create_default_context()
 _UNVERIFIED_CTX.check_hostname = False
@@ -171,6 +202,8 @@ class Config:
     api_threshold: float
     operator_age_days: int
     operator_namespaces: str
+    operator_exclude_prefixes: str
+    operator_event_hours: int
     event_history_minutes: int
     check_ml_nodes: bool
     ml_node_pattern: str
@@ -245,7 +278,22 @@ def parse_args(argv: list[str] | None = None) -> Config:
         "--operator-namespaces",
         default=OPERATOR_NAMESPACES,
         metavar="NS",
-        help="comma-separated namespaces to check for operator pods",
+        help="comma-separated namespaces always included in the operator scan "
+        "(the scan covers every namespace except the excluded prefixes)",
+    )
+    parser.add_argument(
+        "--operator-exclude-prefixes",
+        default=OPERATOR_EXCLUDE_PREFIXES,
+        metavar="PREFIX,...",
+        help="namespace prefixes skipped by the operator scan - the platform's own "
+        "controllers (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--operator-event-hours",
+        type=int,
+        default=OPERATOR_EVENT_WINDOW_HOURS,
+        metavar="HOURS",
+        help="operator reconciliation events must be newer than this to count (default: %(default)s)",
     )
     parser.add_argument(
         "--csv", type=Path, metavar="FILE", help="append a result row to a CSV file"
@@ -310,6 +358,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         api_threshold=args.api_threshold,
         operator_age_days=args.operator_age,
         operator_namespaces=args.operator_namespaces,
+        operator_exclude_prefixes=args.operator_exclude_prefixes,
+        operator_event_hours=args.operator_event_hours,
         event_history_minutes=args.events,
         check_ml_nodes=not args.no_ml_check,
         ml_node_pattern=ML_NODE_PATTERN,
@@ -337,6 +387,7 @@ class Oc:
         self.verbose = verbose
         self._nodes: list[dict[str, Any]] | None = None
         self._top_lines: list[str] | None = None
+        self._event_rows: list[str] | None = None
 
     def run(self, args: list[str], timeout: float = OC_TIMEOUT) -> str | None:
         """Run oc; return stdout on success, None on failure or timeout."""
@@ -403,20 +454,23 @@ class Oc:
                 self._nodes = []
         return self._nodes
 
-    def namespace_exists(self, namespace: str) -> bool:
-        return self.run(["get", "namespace", namespace]) is not None
-
-    def pods_in(self, namespace: str) -> list[str]:
-        out = self.run(["get", "pods", "-n", namespace, "--no-headers"])
+    def pods_all(self) -> list[str]:
+        """Cluster-wide pod rows: namespace, name, owner kind, owner name, created."""
+        out = self.run(["get", "pods", "-A", "-o", PODS_ALL_JSONPATH])
         return [ln for ln in (out or "").splitlines() if ln.strip()]
 
-    def events_in(self, namespace: str) -> list[str]:
-        out = self.run(["get", "events", "-n", namespace, "--sort-by=.lastTimestamp"])
+    def replicasets_all(self) -> list[str]:
+        """Cluster-wide ReplicaSet rows: namespace, name, created."""
+        out = self.run(["get", "rs", "-A", "-o", REPLICASETS_ALL_JSONPATH])
         return [ln for ln in (out or "").splitlines() if ln.strip()]
 
-    def all_events(self) -> list[str]:
-        out = self.run(["get", "events", "-A", "--sort-by=.lastTimestamp"])
-        return [ln for ln in (out or "").splitlines() if ln.strip()]
+    def events_all_rows(self) -> list[str]:
+        """Cached cluster-wide event rows: namespace, type, reason, object
+        kind, object name, message, lastTimestamp, firstTimestamp."""
+        if self._event_rows is None:
+            out = self.run(["get", "events", "-A", "-o", EVENTS_ALL_JSONPATH])
+            self._event_rows = [ln for ln in (out or "").splitlines() if ln.strip()]
+        return self._event_rows
 
     def machines(self) -> list[dict[str, Any]]:
         out = self.run(["get", "machines", "-n", "openshift-machine-api", "-o", "json"])
@@ -901,57 +955,131 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode]) -> 
     return CheckOutcome(entry["result"], entry, counted=True)
 
 
-def convert_age_to_days(age: str) -> int:
-    """Parse oc's AGE column ("12d", "5h", "30m") into days."""
-    match = AGE_RE.match(age)
-    if match:
-        return int(match.group(1))
-    return 0  # h/m/s all round to zero days
+def parse_k8s_timestamp(ts: str) -> datetime | None:
+    """Parse a Kubernetes timestamp ("2026-10-01T12:34:56Z"); None when
+    absent or malformed.  Naive values (oc never emits them, but they are
+    never trusted either) are read as UTC so callers' arithmetic stays
+    well-defined."""
+    if not ts:
+        return None
+    try:
+        parsed = datetime.fromisoformat(ts)  # 3.11+: "Z" is accepted directly
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
 
 
-def check_operators(cfg: Config, oc: Oc) -> CheckOutcome:
-    """Operators criterion: old pods with few recent reconciliation events.
+def check_operators(cfg: Config, oc: Oc, now: datetime | None = None) -> CheckOutcome:
+    """Operators criterion: controller age and recent reconciliation events.
 
-    The pod AGE is taken from the LAST field of each line: oc renders
-    RESTARTS as "N (Nd ago)" on restarted pods, which shifts AGE out of the
-    fixed column the bash script read (its known bug, fixed here).
+    Scope is every namespace on the cluster except the excluded platform
+    prefixes, plus the configured namespaces (an always-include override, so
+    an ODH namespace that happens to match a prefix still counts).  A unit
+    is a pod matching POD_RE, aged by its ReplicaSet's creation time when it
+    has one - a rollout resets both, a drain only the pod, and the
+    ReplicaSet age is the "last deliberate change" signal - and by the pod's
+    own creation time otherwise; replicas of one ReplicaSet are a single
+    unit.  The criterion votes ACTIVE when the MEDIAN unit age is below the
+    threshold (a majority redeployed recently; the old oldest-pod rule was
+    blind to a partial rollout masked by one stale survivor) or when
+    reconciliation events inside the event window reach
+    OPERATOR_EVENT_THRESHOLD.  Events about workload machinery (pods,
+    deployments, ...) are excluded from that count: node drains manufacture
+    them by the dozen, and the age half already treats drains as noise.
     """
+    now = now or datetime.now(UTC)
     entry: dict[str, Any] = {"result": "N/A", "age_days": 0}
-    namespaces = [ns.strip() for ns in cfg.operator_namespaces.split(",") if ns.strip()]
 
-    oldest_days = 0
-    found: list[str] = []
-    existing: list[str] = []
-    for namespace in namespaces:
-        if not oc.namespace_exists(namespace):
-            continue
-        existing.append(namespace)
-        # Parity with the bash script: only the first five matching pods per
-        # namespace are considered.
-        matching = [ln for ln in oc.pods_in(namespace) if POD_RE.search(ln)][:5]
-        if not matching:
-            continue
-        found.append(namespace)
-        for line in matching:
-            fields = line.split()
-            if fields:
-                oldest_days = max(oldest_days, convert_age_to_days(fields[-1]))
+    always = {ns.strip() for ns in cfg.operator_namespaces.split(",") if ns.strip()}
+    excludes = [p.strip() for p in cfg.operator_exclude_prefixes.split(",") if p.strip()]
 
-    if not found:
+    def in_scope(namespace: str) -> bool:
+        return namespace in always or not namespace.startswith(tuple(excludes))
+
+    # Unit key: (namespace, kind, name).  A "replicaset" key collapses the
+    # replicas of one ReplicaSet into a single unit.
+    units: dict[tuple[str, str, str], datetime | None] = {}
+    rs_wanted = False
+    for line in oc.pods_all():
+        fields = line.split("\t")
+        if len(fields) != 5:
+            continue
+        namespace, pod, owner_kind, owner_name, created_raw = fields
+        if not in_scope(namespace) or not POD_RE.search(pod):
+            continue
+        pod_created = parse_k8s_timestamp(created_raw)
+        if owner_kind == "ReplicaSet" and owner_name:
+            rs_wanted = True
+            key = (namespace, "replicaset", owner_name)
+            # Provisional pod age: it stands until the ReplicaSet's own
+            # creation time is looked up, and remains the fallback for a
+            # ReplicaSet deleted mid-rollout whose pods outlive it - the
+            # oldest replica is the closest proxy for the missing age.
+            if pod_created is None:
+                units.setdefault(key, None)
+            elif units.get(key) is None or pod_created < units[key]:
+                units[key] = pod_created
+        elif pod_created is not None:
+            units[(namespace, "pod", pod)] = pod_created
+
+    if not units:
+        entry["reason"] = "no controller pods in any scanned namespace"
+        return CheckOutcome("N/A", entry, counted=False)
+
+    if rs_wanted:
+        # Only ReplicaSets owning a live in-scope pod are read: the cluster
+        # also holds old scaled-to-zero revisions whose ages would read
+        # "install date", not "last change".
+        for line in oc.replicasets_all():
+            fields = line.split("\t")
+            if len(fields) != 3:
+                continue
+            rs_created = parse_k8s_timestamp(fields[2])
+            if rs_created is None:
+                continue
+            key = (fields[0], "replicaset", fields[1])
+            if key in units:
+                units[key] = rs_created
+
+    units = {key: created for key, created in units.items() if created is not None}
+    if not units:
+        entry["reason"] = "no controller pods with a readable creation time"
         return CheckOutcome("N/A", entry, counted=False)
 
     events = 0
-    for namespace in existing:
-        # oc sorts by lastTimestamp; only the most recent 20 events count.
-        for line in oc.events_in(namespace)[-20:]:
-            if OPERATOR_EVENT_RE.search(line):
-                events += 1
+    excluded_workload = 0
+    window_start = now - timedelta(hours=cfg.operator_event_hours)
+    for line in oc.events_all_rows():
+        fields = line.split("\t")
+        # namespace, type, reason, object kind, object name, message (which
+        # may itself contain tabs), lastTimestamp, firstTimestamp.
+        if len(fields) < 8:
+            continue
+        if not in_scope(fields[0]):
+            continue
+        timestamp = parse_k8s_timestamp(fields[-2]) or parse_k8s_timestamp(fields[-1])
+        if timestamp is None or timestamp < window_start:
+            continue
+        if not OPERATOR_EVENT_RE.search(" ".join(fields[1:-2])):
+            continue
+        if fields[3] in OPERATOR_WORKLOAD_KINDS:
+            excluded_workload += 1
+        else:
+            events += 1
 
-    idle = oldest_days >= cfg.operator_age_days and events < OPERATOR_EVENT_THRESHOLD
+    ages_days = {key: (now - created).total_seconds() / 86400 for key, created in units.items()}
+    median_age = statistics.median(ages_days.values())
+    idle = median_age >= cfg.operator_age_days and events < OPERATOR_EVENT_THRESHOLD
     entry["result"] = "IDLE" if idle else "ACTIVE"
-    entry["age_days"] = oldest_days
+    entry["age_days"] = round(median_age, 2)
+    entry["units"] = [
+        {"namespace": ns, "kind": kind, "name": name, "age_days": round(age, 2)}
+        for (ns, kind, name), age in sorted(ages_days.items(), key=lambda kv: kv[1], reverse=True)
+    ]
+    entry["namespaces"] = sorted({ns for ns, _, _ in units})
     entry["events"] = events
-    entry["namespaces"] = found
+    entry["events_excluded_workload"] = excluded_workload
+    entry["event_window_hours"] = cfg.operator_event_hours
     return CheckOutcome(entry["result"], entry, counted=True)
 
 
@@ -1061,12 +1189,22 @@ def ml_node_report(
     return True
 
 
-def recent_activity_report(oc: Oc, event_minutes: int) -> None:
+def recent_activity_report(oc: Oc, event_minutes: int, now: datetime | None = None) -> None:
     """Verbose-only recent pod activity display."""
-    lines = oc.all_events()
-    recent = [ln for ln in lines if RECENT_ACTIVITY_RE.search(ln)]
-    count = len(recent)
-    log_info(f"Pod-related events in the last {event_minutes} minutes: {count}")
+    now = now or datetime.now(UTC)
+    cutoff = now - timedelta(minutes=event_minutes)
+    recent: list[str] = []
+    for row in oc.events_all_rows():
+        fields = row.split("\t")
+        if len(fields) < 8:
+            continue
+        timestamp = parse_k8s_timestamp(fields[-2]) or parse_k8s_timestamp(fields[-1])
+        if timestamp is None or timestamp < cutoff:
+            continue
+        line = " ".join(fields[1:-2])
+        if RECENT_ACTIVITY_RE.search(line):
+            recent.append(line)
+    log_info(f"Pod-related events in the last {event_minutes} minutes: {len(recent)}")
     for line in recent[-5:]:
         log_info(f"  {line}")
 
@@ -1202,8 +1340,9 @@ def run(argv: list[str] | None = None) -> int:
     log_info(f"GPU Result: {gpu_outcome.result}")
 
     # --- CHECK 5: Operators ---
+    now = datetime.now(UTC)
     log_info("--- CHECK 5: Operators ---")
-    operators_outcome = check_operators(cfg, oc)
+    operators_outcome = check_operators(cfg, oc, now)
     log_info(f"Operators Result: {operators_outcome.result}")
 
     # --- Informational (never votes) ---
@@ -1236,7 +1375,6 @@ def run(argv: list[str] | None = None) -> int:
     outcomes = [cpu_outcome, memory_outcome, api_outcome, gpu_outcome, operators_outcome]
     total, met, threshold, status, exit_code = compute_verdict(outcomes)
 
-    now = datetime.now(UTC)
     report: dict[str, Any] = {
         "timestamp": now.isoformat(timespec="seconds"),
         "timestamp_human": now.strftime("%a %b %d %H:%M:%S UTC %Y"),
@@ -1249,6 +1387,8 @@ def run(argv: list[str] | None = None) -> int:
             "memory_threshold": cfg.memory_idle_threshold,
             "api_threshold": cfg.api_threshold,
             "operator_age_threshold_days": cfg.operator_age_days,
+            "operator_event_window_hours": cfg.operator_event_hours,
+            "operator_exclude_prefixes": cfg.operator_exclude_prefixes,
             "cpu_peak_threshold": cfg.cpu_peak_threshold,
             "cpu_shape_ratio": cfg.cpu_shape_ratio,
             "gpu_peak_threshold": cfg.gpu_peak_threshold,
