@@ -27,10 +27,8 @@ def test_spike_rule_defaults():
     cfg = oic.parse_args([])
     assert cfg.cpu_peak_threshold == 40.0
     assert cfg.cpu_shape_ratio == 2.0
-    assert cfg.cpu_shape_floor == 20.0
     assert cfg.gpu_peak_threshold == 40.0
     assert cfg.gpu_shape_ratio == 2.0
-    assert cfg.gpu_shape_floor == 20.0
     assert cfg.api_spike_ratio == 2.0
     assert cfg.api_spike_floor == 50.0
 
@@ -55,14 +53,10 @@ def test_spike_rule_flags():
             "55",
             "--cpu-shape-ratio",
             "3",
-            "--cpu-shape-floor",
-            "25",
             "--gpu-peak-threshold",
             "60",
             "--gpu-shape-ratio",
             "2.5",
-            "--gpu-shape-floor",
-            "30",
             "--api-spike-ratio",
             "4",
             "--api-spike-floor",
@@ -71,12 +65,19 @@ def test_spike_rule_flags():
     )
     assert cfg.cpu_peak_threshold == 55.0
     assert cfg.cpu_shape_ratio == 3.0
-    assert cfg.cpu_shape_floor == 25.0
     assert cfg.gpu_peak_threshold == 60.0
     assert cfg.gpu_shape_ratio == 2.5
-    assert cfg.gpu_shape_floor == 30.0
     assert cfg.api_spike_ratio == 4.0
     assert cfg.api_spike_floor == 75.0
+
+
+def test_removed_shape_floor_flags_are_rejected():
+    # The CPU/GPU shape floors were removed; passing them must fail loudly
+    # rather than be silently ignored.
+    with pytest.raises(SystemExit):
+        oic.parse_args(["--cpu-shape-floor", "20"])
+    with pytest.raises(SystemExit):
+        oic.parse_args(["--gpu-shape-floor", "20"])
 
 
 def test_legacy_flags_still_parse():

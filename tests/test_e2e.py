@@ -171,10 +171,8 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
         "operator_age_threshold_days",
         "cpu_peak_threshold",
         "cpu_shape_ratio",
-        "cpu_shape_floor",
         "gpu_peak_threshold",
         "gpu_shape_ratio",
-        "gpu_shape_floor",
         "api_spike_ratio",
         "api_spike_floor",
     ]

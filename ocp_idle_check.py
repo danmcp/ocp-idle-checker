@@ -11,17 +11,17 @@ A cluster is IDLE when at least 80% of the applicable criteria vote IDLE:
   cpu        spike/shape rule on per-node 15-minute CPU averages taken from
              the Prometheus query_range matrix: ACTIVE when any 15-minute
              window averaged above the peak threshold, or when the window
-             peak is more than shape-ratio times the median window while
-             sitting above the shape floor (the floor keeps quiet baselines
-             from tripping the ratio alone).  Falls back to the legacy
-             window-average rule when the matrix is unavailable.  An instant
+             peak is more than shape-ratio times the median window.  Falls
+             back to the legacy window-average rule when the matrix is
+             unavailable.  An instant
              reading above the idle threshold can still override an IDLE
              result (one-directional, as in the bash version).
   memory     legacy window-average rule with the same one-directional
              instant override.
   api_server legacy window-average request rate against the threshold, plus
              a spike detector: any 15-minute window above spike-ratio times
-             the median window also counts as ACTIVE.
+             the median window (and above an absolute floor) also counts as
+             ACTIVE.
   gpu        the same spike/shape rule as cpu, on DCGM GPU utilization
              (DCGM_FI_DEV_GPU_UTIL).  N/A (not counted) on clusters without
              GPU nodes or without DCGM metrics.
@@ -29,10 +29,11 @@ A cluster is IDLE when at least 80% of the applicable criteria vote IDLE:
              events in the configured namespaces.  N/A (not counted) when no
              configured namespace holds operator pods.
 
-The spike/shape parameters (peak threshold, ratio, floor) are fleet
-calibration knobs exposed as command-line flags; the defaults are
-provisional.  "Baseline" is the median of the 15-minute windows on the
-query_range path and the window mean on the aggregate fallback path.
+The spike/shape parameters (peak threshold, ratio; the API spike rule also
+has an absolute floor) are fleet calibration knobs exposed as command-line
+flags; the defaults are provisional.  "Baseline" is the median of the
+15-minute windows on the query_range path and the window mean on the
+aggregate fallback path.
 
 Exit codes:
   0 = cluster is ACTIVE
@@ -83,10 +84,8 @@ ML_NODE_PATTERN = "p5|p4d|g5"
 # Spike/shape rule defaults - fleet-calibration knobs, ideal values TBD.
 CPU_PEAK_THRESHOLD = 40.0  # percent; any 15-min window above this = ACTIVE
 CPU_SHAPE_RATIO = 2.0  # peak / baseline above this = ACTIVE
-CPU_SHAPE_FLOOR = 20.0  # percent; peak must reach this for the ratio to count
 GPU_PEAK_THRESHOLD = 40.0
 GPU_SHAPE_RATIO = 2.0
-GPU_SHAPE_FLOOR = 20.0
 API_SPIKE_RATIO = 2.0  # peak / baseline above this = ACTIVE
 API_SPIKE_FLOOR = 50.0  # requests/sec; peak must reach this for the ratio to count
 
@@ -177,10 +176,8 @@ class Config:
     ml_node_pattern: str
     cpu_peak_threshold: float
     cpu_shape_ratio: float
-    cpu_shape_floor: float
     gpu_peak_threshold: float
     gpu_shape_ratio: float
-    gpu_shape_floor: float
     api_spike_ratio: float
     api_spike_floor: float
     verbose: bool
@@ -270,13 +267,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         help="CPU spike rule: peak/baseline above this = ACTIVE (default: %(default)s)",
     )
     parser.add_argument(
-        "--cpu-shape-floor",
-        type=float,
-        default=CPU_SHAPE_FLOOR,
-        metavar="N",
-        help="CPU spike rule: peak must reach this percent for the ratio to count (default: %(default)s)",
-    )
-    parser.add_argument(
         "--gpu-peak-threshold",
         type=float,
         default=GPU_PEAK_THRESHOLD,
@@ -289,13 +279,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         default=GPU_SHAPE_RATIO,
         metavar="N",
         help="GPU spike rule: peak/baseline above this = ACTIVE (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--gpu-shape-floor",
-        type=float,
-        default=GPU_SHAPE_FLOOR,
-        metavar="N",
-        help="GPU spike rule: peak must reach this percent for the ratio to count (default: %(default)s)",
     )
     parser.add_argument(
         "--api-spike-ratio",
@@ -332,10 +315,8 @@ def parse_args(argv: list[str] | None = None) -> Config:
         ml_node_pattern=ML_NODE_PATTERN,
         cpu_peak_threshold=args.cpu_peak_threshold,
         cpu_shape_ratio=args.cpu_shape_ratio,
-        cpu_shape_floor=args.cpu_shape_floor,
         gpu_peak_threshold=args.gpu_peak_threshold,
         gpu_shape_ratio=args.gpu_shape_ratio,
-        gpu_shape_floor=args.gpu_shape_floor,
         api_spike_ratio=args.api_spike_ratio,
         api_spike_floor=args.api_spike_floor,
         verbose=not args.quiet,
@@ -664,14 +645,15 @@ def evaluate_shape(
     *,
     peak_threshold: float,
     ratio_threshold: float,
-    floor: float,
+    floor: float | None = None,
 ) -> ShapeStats:
     """The spike/shape rule: ACTIVE when any window exceeded `peak_threshold`,
-    or when the peak is `ratio_threshold` times the baseline while reaching
-    `floor` (so a quiet baseline cannot trip the ratio on its own).
+    or when the peak is `ratio_threshold` times the baseline.
 
-    A zero baseline with a nonzero peak counts as an unbounded ratio, gated
-    by the floor just the same.
+    A zero baseline with a nonzero peak counts as an unbounded ratio.
+    `floor`, when given, additionally requires the peak to reach it before
+    the ratio branch counts; only the API spike rule passes one, to keep
+    ratios computed on absolutely quiet traffic from firing.
     """
     if not points:
         return ShapeStats(0, 0.0, 0.0, None, False, False)
@@ -679,7 +661,9 @@ def evaluate_shape(
     baseline = statistics.median(points)
     ratio = peak / baseline if baseline > 0 else None
     peak_exceeded = peak > peak_threshold
-    shape_exceeded = peak > 0 and peak >= floor and (ratio is None or ratio > ratio_threshold)
+    shape_exceeded = (
+        peak > 0 and (floor is None or peak >= floor) and (ratio is None or ratio > ratio_threshold)
+    )
     return ShapeStats(len(points), peak, baseline, ratio, peak_exceeded, shape_exceeded)
 
 
@@ -736,7 +720,6 @@ def check_cpu(
                 points,
                 peak_threshold=cfg.cpu_peak_threshold,
                 ratio_threshold=cfg.cpu_shape_ratio,
-                floor=cfg.cpu_shape_floor,
             )
         else:
             log_info("CPU query_range matrix unavailable; using legacy window average")
@@ -872,7 +855,6 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode]) -> 
             points,
             peak_threshold=cfg.gpu_peak_threshold,
             ratio_threshold=cfg.gpu_shape_ratio,
-            floor=cfg.gpu_shape_floor,
         )
     else:
         # Aggregate fallback: whole-window max/avg per series.  All exporter
@@ -905,11 +887,7 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode]) -> 
                 baseline=baseline,
                 ratio=ratio,
                 peak_exceeded=peak > cfg.gpu_peak_threshold,
-                shape_exceeded=(
-                    peak > 0
-                    and peak >= cfg.gpu_shape_floor
-                    and (ratio is None or ratio > cfg.gpu_shape_ratio)
-                ),
+                shape_exceeded=(peak > 0 and (ratio is None or ratio > cfg.gpu_shape_ratio)),
             )
             source = "window aggregates fallback"
         else:
@@ -1273,10 +1251,8 @@ def run(argv: list[str] | None = None) -> int:
             "operator_age_threshold_days": cfg.operator_age_days,
             "cpu_peak_threshold": cfg.cpu_peak_threshold,
             "cpu_shape_ratio": cfg.cpu_shape_ratio,
-            "cpu_shape_floor": cfg.cpu_shape_floor,
             "gpu_peak_threshold": cfg.gpu_peak_threshold,
             "gpu_shape_ratio": cfg.gpu_shape_ratio,
-            "gpu_shape_floor": cfg.gpu_shape_floor,
             "api_spike_ratio": cfg.api_spike_ratio,
             "api_spike_floor": cfg.api_spike_floor,
         },

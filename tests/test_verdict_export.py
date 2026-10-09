@@ -149,5 +149,4 @@ def test_base_config_matches_shipped_defaults():
     cfg = base_config()
     assert cfg.time_window_minutes == oic.DEFAULT_TIME_WINDOW_MINUTES
     assert cfg.cpu_peak_threshold == oic.CPU_PEAK_THRESHOLD
-    assert cfg.gpu_shape_floor == oic.GPU_SHAPE_FLOOR
     assert cfg.api_spike_floor == oic.API_SPIKE_FLOOR

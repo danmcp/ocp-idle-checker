@@ -49,7 +49,7 @@ def test_cpu_active_on_peak():
 
 def test_cpu_active_on_shape_ratio():
     # Median 5%, peak 30%: no window crossed the peak threshold, but the
-    # peak is 6x the baseline and above the floor.
+    # peak is 6x the median.
     prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["5", "5", "30"])]})
     outcome = oic.check_cpu(base_config(), prom, {"node-1"}, None)
     assert outcome.result == "ACTIVE"
@@ -59,6 +59,25 @@ def test_cpu_active_on_shape_ratio():
 
 
 def test_cpu_quiet_cluster_is_idle():
+    # Steady quiet load: the peak barely rises above the median, so neither
+    # branch fires.
+    prom = FakeProm(
+        ranges={
+            oic.CPU_RANGE_QUERY: [
+                make_range_series("node-1", ["8", "8", "10"]),
+                make_range_series("node-2", ["8", "8", "9"]),
+            ]
+        }
+    )
+    outcome = oic.check_cpu(base_config(), prom, {"node-1", "node-2"}, 2.0)
+    assert outcome.result == "IDLE"
+    assert outcome.entry["instant_override"] is False
+    assert outcome.entry["value"] == "10.00"
+
+
+def test_cpu_bursty_quiet_cluster_is_active():
+    # Median 2%, peak 10%: nothing crosses the peak threshold, but the 5x
+    # ratio is a real burst - with the shape floor removed, this counts.
     prom = FakeProm(
         ranges={
             oic.CPU_RANGE_QUERY: [
@@ -68,9 +87,10 @@ def test_cpu_quiet_cluster_is_idle():
         }
     )
     outcome = oic.check_cpu(base_config(), prom, {"node-1", "node-2"}, 2.0)
-    assert outcome.result == "IDLE"
-    assert outcome.entry["instant_override"] is False
-    assert outcome.entry["value"] == "10.00"
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["peak_exceeded"] is False
+    assert outcome.entry["shape_exceeded"] is True
+    assert outcome.entry["ratio"] == 5.0
 
 
 def test_cpu_dead_node_series_are_ignored():
@@ -116,7 +136,9 @@ def test_cpu_legacy_fallback_idle():
 
 
 def test_cpu_instant_override_beats_idle_shape():
-    prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["2", "2", "10"])]})
+    # Steady quiet windows, so the ACTIVE verdict comes from the instant
+    # reading alone.
+    prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["8", "8", "10"])]})
     outcome = oic.check_cpu(base_config(), prom, {"node-1"}, 50.0)
     assert outcome.result == "ACTIVE"
     assert outcome.entry["instant_override"] is True
@@ -305,12 +327,13 @@ def test_gpu_active_on_shape_ratio():
     outcome = oic.check_gpu(base_config(), prom, [gpu_node()])
     assert outcome.result == "ACTIVE"
     assert outcome.entry["peak_exceeded"] is False
-    assert outcome.entry["shape_exceeded"] is True  # zero baseline, peak above floor
+    assert outcome.entry["shape_exceeded"] is True  # zero baseline, unbounded ratio
     assert outcome.entry["ratio"] is None
 
 
 def test_gpu_quiet_is_idle():
-    prom = FakeProm(ranges={oic.GPU_RANGE_QUERY: [make_dcgm_series(["2", "2", "10"])]})
+    # Steady quiet utilization: ratio 1.25, well below both branches.
+    prom = FakeProm(ranges={oic.GPU_RANGE_QUERY: [make_dcgm_series(["8", "8", "10"])]})
     outcome = oic.check_gpu(base_config(), prom, [gpu_node()])
     assert outcome.result == "IDLE"
 

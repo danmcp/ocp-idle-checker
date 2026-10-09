@@ -25,24 +25,28 @@ Detects if your OpenShift cluster is idle based on CPU, memory, API server activ
 
 ## Idle Criteria (80% must pass)
 
-1. **CPU** — spike/shape rule over 15-minute windows (see below)
-2. **Memory** < 35% (time-windowed average)
-3. **API Server** < 100 req/sec, plus a spike detector
-4. **GPU** — spike/shape rule on DCGM GPU utilization (only on clusters with GPU nodes)
-5. **Operators** ≥ 7 days old with low activity
-
-### Decision Logic
-
 Each criterion is evaluated independently and can be `IDLE`, `ACTIVE`, `UNKNOWN`, or `N/A`. The cluster is declared **IDLE** when the number of `IDLE` results reaches `int(total_criteria × 0.80)`.
+
+### Active Rules
+
+| Criterion | Votes ACTIVE when |
+|-----------|-------------------|
+| **CPU** | any 15-minute window > 40%, or the window peak > 2× the median window; an instant `oc adm top nodes` reading ≥ 15% can also flip an otherwise-IDLE result |
+| **Memory** | the time-windowed average ≥ 35%, or an instant snapshot ≥ 35% (one-directional override) |
+| **API Server** | the time-windowed average ≥ 100 req/sec, or any 15-minute window > 2× the median window while above 50 req/s |
+| **GPU** | any 15-minute window > 40%, or the window peak > 2× the median window (DCGM GPU utilization) |
+| **Operators** | the oldest operator pod is < 7 days old, or ≥ 5 recent reconciliation events |
+
+A criterion votes IDLE when none of its ACTIVE conditions hold. Some criteria can instead be N/A — not counted in the denominator (see [Conditional Criteria](#conditional-criteria)).
 
 ### Spike/Shape Detection (CPU & GPU)
 
 The CPU and GPU criteria pool per-node 15-minute window averages from the Prometheus `query_range` matrix and evaluate:
 
 - **Peak rule**: any 15-minute window averaged above the peak threshold (default 40%), **or**
-- **Shape rule**: the window peak is more than shape-ratio times (default 2×) the median window while sitting above the shape floor (default 20%).
+- **Shape rule**: the window peak is more than shape-ratio times (default 2×) the median window.
 
-The floor keeps quiet baselines from tripping the ratio alone: a cluster whose median window is 2% and whose peak window is 10% is a 5× ratio but still quiet, while median 5% with peaks at 30% is genuinely bursty and counts as active. A zero baseline with a nonzero peak counts as an unbounded ratio, gated by the floor just the same.
+A zero baseline with a nonzero peak counts as an unbounded ratio and trips the shape rule. There is deliberately no absolute floor on the ratio: a cluster whose median window is 2% and whose peak window is 10% is a 5× variation and counts as bursty.
 
 CPU falls back to the legacy window-average rule when the range matrix is unavailable, and an instant `oc adm top nodes` reading above the idle threshold can still override an IDLE result (one-directional, as in the bash version).
 
@@ -84,10 +88,8 @@ CPU and memory `UNKNOWN` still count toward the denominator (they never help the
 | `--operator-namespaces NS` | Operator namespaces to check | opendatahub,redhat-ods-operator,redhat-ods-applications |
 | `--cpu-peak-threshold N` | CPU: any 15-min window above this % = ACTIVE | 40 |
 | `--cpu-shape-ratio N` | CPU: peak/median above this = ACTIVE | 2 |
-| `--cpu-shape-floor N` | CPU: peak must reach this % for the ratio to count | 20 |
 | `--gpu-peak-threshold N` | GPU: any 15-min window above this % = ACTIVE | 40 |
 | `--gpu-shape-ratio N` | GPU: peak/median above this = ACTIVE | 2 |
-| `--gpu-shape-floor N` | GPU: peak must reach this % for the ratio to count | 20 |
 | `--api-spike-ratio N` | API: peak/median above this = ACTIVE | 2 |
 | `--api-spike-floor N` | API: peak must reach this many req/s for the ratio to count | 50 |
 | `--csv FILE` | Export to CSV | - |

@@ -13,14 +13,13 @@ from helpers import base_config
     [
         # Peak branch: any 15-min window above the threshold.
         ([5.0, 5.0, 45.0], True, "peak above threshold"),
-        ([5.0] * 10 + [30.0], True, "shape: median 5, peak 30, ratio 6, above floor"),
-        # Quiet baselines must not trip the ratio alone.
-        ([2.0, 2.0, 15.0], False, "ratio 7.5 but peak below the floor"),
-        ([20.0] * 10, False, "steady moderate load: ratio 1, peak at floor"),
-        ([25.0] * 10, False, "steady load above the floor but below the peak threshold"),
-        # A zero baseline with a nonzero peak is an unbounded ratio, floored.
-        ([0.0, 0.0, 25.0], True, "zero median, peak above floor"),
-        ([0.0, 0.0, 10.0], False, "zero median, peak below floor"),
+        ([5.0] * 10 + [30.0], True, "shape: median 5, peak 30, ratio 6"),
+        # No floor: a quiet baseline with a bursty peak trips the ratio alone.
+        ([2.0, 2.0, 15.0], True, "ratio 7.5 on a quiet baseline"),
+        ([20.0] * 10, False, "steady moderate load: ratio 1"),
+        ([25.0] * 10, False, "steady load below the peak threshold"),
+        # A zero baseline with a nonzero peak is an unbounded ratio.
+        ([0.0, 0.0, 10.0], True, "zero median, unbounded ratio"),
         ([0.0] * 5, False, "all-zero data"),
         ([], False, "no data"),
         # Boundaries: strictly greater-than on both branches.
@@ -33,7 +32,6 @@ def test_evaluate_shape(points, expected_active, why):
         points,
         peak_threshold=40.0,
         ratio_threshold=2.0,
-        floor=20.0,
     )
     assert stats.active is expected_active, why
 
@@ -43,7 +41,6 @@ def test_evaluate_shape_reports_stats():
         [4.0, 5.0, 6.0, 30.0],
         peak_threshold=40.0,
         ratio_threshold=2.0,
-        floor=20.0,
     )
     assert stats.points == 4
     assert stats.peak == pytest.approx(30.0)
@@ -59,10 +56,28 @@ def test_evaluate_shape_zero_baseline_ratio_is_none():
         [0.0, 0.0, 22.0],
         peak_threshold=40.0,
         ratio_threshold=2.0,
-        floor=20.0,
     )
     assert stats.ratio is None
-    assert stats.shape_exceeded  # unbounded ratio, gated only by the floor
+    assert stats.shape_exceeded  # unbounded ratio
+
+
+def test_evaluate_shape_optional_floor_gates_the_ratio_branch():
+    # Only the API spike rule passes a floor: a peak below it cannot trip
+    # the ratio branch, even with an unbounded one.
+    below = oic.evaluate_shape(
+        [0.0, 0.0, 40.0],
+        peak_threshold=1000.0,
+        ratio_threshold=2.0,
+        floor=50.0,
+    )
+    assert below.shape_exceeded is False
+    above = oic.evaluate_shape(
+        [0.0, 0.0, 60.0],
+        peak_threshold=1000.0,
+        ratio_threshold=2.0,
+        floor=50.0,
+    )
+    assert above.shape_exceeded
 
 
 def test_defaults_catch_the_false_idle_core_shapes():
@@ -74,7 +89,6 @@ def test_defaults_catch_the_false_idle_core_shapes():
         [5.0] * 20 + [96.9],
         peak_threshold=cfg.cpu_peak_threshold,
         ratio_threshold=cfg.cpu_shape_ratio,
-        floor=cfg.cpu_shape_floor,
     )
     assert hot.active
     # mmacik-sno shape: steady ~20% single-node load - stays idle.
@@ -82,6 +96,5 @@ def test_defaults_catch_the_false_idle_core_shapes():
         [19.5, 19.5, 19.5, 19.5],
         peak_threshold=cfg.cpu_peak_threshold,
         ratio_threshold=cfg.cpu_shape_ratio,
-        floor=cfg.cpu_shape_floor,
     )
     assert not steady.active
