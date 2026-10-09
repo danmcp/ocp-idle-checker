@@ -1,0 +1,1337 @@
+#!/usr/bin/env python3
+"""OpenShift cluster idle detection.
+
+Python port of ocp-idle-check.sh (stdlib only).  ocp-idle-check.sh is a thin
+bash shim that execs this file, so existing callers - the Jenkins job
+("bash ocp-idle-check.sh ..."), cluster-monitor's vendored copy, and the
+README examples - keep working unchanged.
+
+A cluster is IDLE when at least 80% of the applicable criteria vote IDLE:
+
+  cpu        spike/shape rule on per-node 15-minute CPU averages taken from
+             the Prometheus query_range matrix: ACTIVE when any 15-minute
+             window averaged above the peak threshold, or when the window
+             peak is more than shape-ratio times the median window while
+             sitting above the shape floor (the floor keeps quiet baselines
+             from tripping the ratio alone).  Falls back to the legacy
+             window-average rule when the matrix is unavailable.  An instant
+             reading above the idle threshold can still override an IDLE
+             result (one-directional, as in the bash version).
+  memory     legacy window-average rule with the same one-directional
+             instant override.
+  api_server legacy window-average request rate against the threshold, plus
+             a spike detector: any 15-minute window above spike-ratio times
+             the median window also counts as ACTIVE.
+  gpu        the same spike/shape rule as cpu, on DCGM GPU utilization
+             (DCGM_FI_DEV_GPU_UTIL).  N/A (not counted) on clusters without
+             GPU nodes or without DCGM metrics.
+  operators  legacy rule: oldest operator pod age and recent reconciliation
+             events in the configured namespaces.  N/A (not counted) when no
+             configured namespace holds operator pods.
+
+The spike/shape parameters (peak threshold, ratio, floor) are fleet
+calibration knobs exposed as command-line flags; the defaults are
+provisional.  "Baseline" is the median of the 15-minute windows on the
+query_range path and the window mean on the aggregate fallback path.
+
+Exit codes:
+  0 = cluster is ACTIVE
+  1 = cluster is IDLE
+  2 = error (cannot determine state)
+
+OCP_IDLE_PROMETHEUS_URL overrides the thanos-querier route lookup; it exists
+for hermetic tests and manual debugging.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import os
+import re
+import shutil
+import ssl
+import statistics
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+
+# === CONFIGURATION DEFAULTS ================================================
+
+# Matches the effective value every real caller passes (-w 10080); the old
+# bash default of 10 minutes made the windowed checks near-instantaneous and
+# would leave the spike/shape rule with a single data point.
+DEFAULT_TIME_WINDOW_MINUTES = 10080  # 7 days
+
+CPU_IDLE_THRESHOLD = 15.0  # percent; instant override + legacy fallback
+MEMORY_IDLE_THRESHOLD = 35.0  # percent
+APISERVER_IDLE_THRESHOLD = 100.0  # requests/sec
+OPERATOR_IDLE_AGE_DAYS = 7
+OPERATOR_NAMESPACES = "opendatahub,redhat-ods-operator,redhat-ods-applications"
+OPERATOR_EVENT_THRESHOLD = 5  # recent reconciliation events
+EVENT_TIME_MINUTES = 60
+ML_NODE_PATTERN = "p5|p4d|g5"
+
+# Spike/shape rule defaults - fleet-calibration knobs, ideal values TBD.
+CPU_PEAK_THRESHOLD = 40.0  # percent; any 15-min window above this = ACTIVE
+CPU_SHAPE_RATIO = 2.0  # peak / baseline above this = ACTIVE
+CPU_SHAPE_FLOOR = 20.0  # percent; peak must reach this for the ratio to count
+GPU_PEAK_THRESHOLD = 40.0
+GPU_SHAPE_RATIO = 2.0
+GPU_SHAPE_FLOOR = 20.0
+API_SPIKE_RATIO = 2.0  # peak / baseline above this = ACTIVE
+API_SPIKE_FLOOR = 50.0  # requests/sec; peak must reach this for the ratio to count
+
+SPIKE_WINDOW_MINUTES = 15  # the "15 min period" of the spike/shape rule
+STEP_SECONDS = 900  # query_range step: one point per 15-min window
+
+# Timeouts (seconds), matching the bash original.
+OC_TIMEOUT = 10
+ROUTE_TIMEOUT = 5
+QUERY_TIMEOUT = 60
+RANGE_TIMEOUT = 180
+
+PROM_URL_OVERRIDE = "OCP_IDLE_PROMETHEUS_URL"
+
+# PromQL templates.  The `by (node, instance)` on the CPU range query is
+# required: OCP node series carry no `node` label, only `instance`.
+CPU_RANGE_QUERY = (
+    '(1 - avg by (node, instance) (rate(node_cpu_seconds_total{mode="idle"}'
+    f"[{SPIKE_WINDOW_MINUTES}m]))) * 100"
+)
+GPU_RANGE_QUERY = f"avg_over_time(DCGM_FI_DEV_GPU_UTIL[{SPIKE_WINDOW_MINUTES}m])"
+API_RANGE_QUERY = f"sum(rate(apiserver_request_total[{SPIKE_WINDOW_MINUTES}m]))"
+
+POD_RE = re.compile(r"controller-manager|operator|dashboard")
+OPERATOR_EVENT_RE = re.compile(r"reconcil|created|updated|scaled", re.IGNORECASE)
+RECENT_ACTIVITY_RE = re.compile(r"Pod|Deployment|ReplicaSet|Job")
+AGE_RE = re.compile(r"^([0-9]+)d")
+
+_UNVERIFIED_CTX = ssl.create_default_context()
+_UNVERIFIED_CTX.check_hostname = False
+_UNVERIFIED_CTX.verify_mode = ssl.CERT_NONE
+
+_VERBOSE = True
+
+
+# === LOGGING ===============================================================
+
+RED = "\033[0;31m"
+GREEN = "\033[0;32m"
+YELLOW = "\033[0;33m"
+BLUE = "\033[0;34m"
+NC = "\033[0m"
+
+
+def set_verbose(verbose: bool) -> None:
+    global _VERBOSE
+    _VERBOSE = verbose
+
+
+def _log(color: str, tag: str, message: str) -> None:
+    if not _VERBOSE:
+        return
+    print(f"{color}[{tag}]{NC} {message}", file=sys.stderr)
+
+
+def log_info(message: str) -> None:
+    _log(BLUE, "INFO", message)
+
+
+def log_ok(message: str) -> None:
+    _log(GREEN, "OK", message)
+
+
+def log_warn(message: str) -> None:
+    _log(YELLOW, "WARN", message)
+
+
+def log_error(message: str) -> None:
+    # Errors are printed even in quiet mode; they explain a non-zero exit.
+    print(f"{RED}[ERROR]{NC} {message}", file=sys.stderr)
+
+
+# === CONFIGURATION =========================================================
+
+
+@dataclass(frozen=True)
+class Config:
+    """All knobs, as parsed from the command line."""
+
+    time_window_minutes: int
+    cpu_idle_threshold: float
+    memory_idle_threshold: float
+    api_threshold: float
+    operator_age_days: int
+    operator_namespaces: str
+    event_history_minutes: int
+    check_ml_nodes: bool
+    ml_node_pattern: str
+    cpu_peak_threshold: float
+    cpu_shape_ratio: float
+    cpu_shape_floor: float
+    gpu_peak_threshold: float
+    gpu_shape_ratio: float
+    gpu_shape_floor: float
+    api_spike_ratio: float
+    api_spike_floor: float
+    verbose: bool
+    debug_probe: bool
+    token: str
+    csv_path: Path | None
+    json_path: Path | None
+
+
+def parse_args(argv: list[str] | None = None) -> Config:
+    parser = argparse.ArgumentParser(
+        prog="ocp-idle-check.sh",
+        description="Detect whether an OpenShift cluster is idle.",
+        allow_abbrev=False,
+    )
+    parser.add_argument(
+        "-w",
+        "--window",
+        type=int,
+        default=DEFAULT_TIME_WINDOW_MINUTES,
+        metavar="MINUTES",
+        help="time window for metric averages (default: %(default)s = 7 days)",
+    )
+    parser.add_argument(
+        "-c",
+        "--cpu-threshold",
+        type=float,
+        default=CPU_IDLE_THRESHOLD,
+        metavar="N",
+        help="CPU idle threshold in percent (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-m",
+        "--mem-threshold",
+        type=float,
+        default=MEMORY_IDLE_THRESHOLD,
+        metavar="N",
+        help="memory idle threshold in percent (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-a",
+        "--api-threshold",
+        type=float,
+        default=APISERVER_IDLE_THRESHOLD,
+        metavar="N",
+        help="API server idle threshold in requests/sec (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-e",
+        "--events",
+        type=int,
+        default=EVENT_TIME_MINUTES,
+        metavar="MINUTES",
+        help="event history window for informational output (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-o",
+        "--operator-age",
+        type=int,
+        default=OPERATOR_IDLE_AGE_DAYS,
+        metavar="DAYS",
+        help="operator idle age threshold in days (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--operator-namespaces",
+        default=OPERATOR_NAMESPACES,
+        metavar="NS",
+        help="comma-separated namespaces to check for operator pods",
+    )
+    parser.add_argument(
+        "--csv", type=Path, metavar="FILE", help="append a result row to a CSV file"
+    )
+    parser.add_argument("--json", type=Path, metavar="FILE", help="write a JSON report")
+    parser.add_argument("--token", default="", metavar="TOKEN", help="Prometheus bearer token")
+    parser.add_argument(
+        "--cpu-peak-threshold",
+        type=float,
+        default=CPU_PEAK_THRESHOLD,
+        metavar="N",
+        help="CPU spike rule: any 15-min window above this percent = ACTIVE (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--cpu-shape-ratio",
+        type=float,
+        default=CPU_SHAPE_RATIO,
+        metavar="N",
+        help="CPU spike rule: peak/baseline above this = ACTIVE (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--cpu-shape-floor",
+        type=float,
+        default=CPU_SHAPE_FLOOR,
+        metavar="N",
+        help="CPU spike rule: peak must reach this percent for the ratio to count (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--gpu-peak-threshold",
+        type=float,
+        default=GPU_PEAK_THRESHOLD,
+        metavar="N",
+        help="GPU spike rule: any 15-min window above this percent = ACTIVE (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--gpu-shape-ratio",
+        type=float,
+        default=GPU_SHAPE_RATIO,
+        metavar="N",
+        help="GPU spike rule: peak/baseline above this = ACTIVE (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--gpu-shape-floor",
+        type=float,
+        default=GPU_SHAPE_FLOOR,
+        metavar="N",
+        help="GPU spike rule: peak must reach this percent for the ratio to count (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--api-spike-ratio",
+        type=float,
+        default=API_SPIKE_RATIO,
+        metavar="N",
+        help="API spike rule: peak/baseline above this = ACTIVE (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--api-spike-floor",
+        type=float,
+        default=API_SPIKE_FLOOR,
+        metavar="N",
+        help="API spike rule: peak must reach this many req/s for the ratio to count (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--debug-probe",
+        action="store_true",
+        help="accepted for compatibility; criteria detail is always exported now",
+    )
+    parser.add_argument("-q", "--quiet", action="store_true", help="minimal output")
+    parser.add_argument("--no-ml-check", action="store_true", help="skip the ML node check")
+    args = parser.parse_args(argv)
+
+    return Config(
+        time_window_minutes=args.window,
+        cpu_idle_threshold=args.cpu_threshold,
+        memory_idle_threshold=args.mem_threshold,
+        api_threshold=args.api_threshold,
+        operator_age_days=args.operator_age,
+        operator_namespaces=args.operator_namespaces,
+        event_history_minutes=args.events,
+        check_ml_nodes=not args.no_ml_check,
+        ml_node_pattern=ML_NODE_PATTERN,
+        cpu_peak_threshold=args.cpu_peak_threshold,
+        cpu_shape_ratio=args.cpu_shape_ratio,
+        cpu_shape_floor=args.cpu_shape_floor,
+        gpu_peak_threshold=args.gpu_peak_threshold,
+        gpu_shape_ratio=args.gpu_shape_ratio,
+        gpu_shape_floor=args.gpu_shape_floor,
+        api_spike_ratio=args.api_spike_ratio,
+        api_spike_floor=args.api_spike_floor,
+        verbose=not args.quiet,
+        debug_probe=args.debug_probe,
+        token=args.token,
+        csv_path=args.csv,
+        json_path=args.json,
+    )
+
+
+# === OC CLI WRAPPER ========================================================
+
+
+class Oc:
+    """Thin wrapper around the oc CLI with per-command result caching."""
+
+    def __init__(self, verbose: bool = False) -> None:
+        self.verbose = verbose
+        self._nodes: list[dict[str, Any]] | None = None
+        self._top_lines: list[str] | None = None
+
+    def run(self, args: list[str], timeout: float = OC_TIMEOUT) -> str | None:
+        """Run oc; return stdout on success, None on failure or timeout."""
+        try:
+            proc = subprocess.run(["oc", *args], capture_output=True, text=True, timeout=timeout)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            if self.verbose:
+                log_warn(f"oc {' '.join(args)} failed: {exc}")
+            return None
+        if proc.returncode != 0:
+            return None
+        return proc.stdout
+
+    def logged_in(self) -> bool:
+        return self.run(["whoami"]) is not None
+
+    def whoami_server(self) -> str:
+        out = self.run(["whoami", "--show-server"])
+        return (out or "").strip() or "Unknown"
+
+    def whoami_token(self) -> str | None:
+        out = self.run(["whoami", "-t"])
+        return out.strip() or None if out else None
+
+    def create_prometheus_token(self) -> str | None:
+        out = self.run(
+            ["create", "token", "prometheus-k8s", "-n", "openshift-monitoring", "--duration=10m"]
+        )
+        return out.strip() or None if out else None
+
+    def route_host(self) -> str | None:
+        out = self.run(
+            [
+                "get",
+                "route",
+                "thanos-querier",
+                "-n",
+                "openshift-monitoring",
+                "-o",
+                "jsonpath={.spec.host}",
+            ],
+            timeout=ROUTE_TIMEOUT,
+        )
+        return out.strip() or None if out else None
+
+    def top_nodes(self) -> list[str]:
+        """Cached `oc adm top nodes --no-headers` lines."""
+        if self._top_lines is None:
+            out = self.run(["adm", "top", "nodes", "--no-headers"])
+            self._top_lines = [ln for ln in (out or "").splitlines() if ln.strip()]
+        return self._top_lines
+
+    def top_node(self, name: str) -> list[str]:
+        out = self.run(["adm", "top", "node", name, "--no-headers"])
+        return [ln for ln in (out or "").splitlines() if ln.strip()]
+
+    def nodes(self) -> list[dict[str, Any]]:
+        """Cached `oc get nodes -o json` items."""
+        if self._nodes is None:
+            out = self.run(["get", "nodes", "-o", "json"])
+            try:
+                self._nodes = json.loads(out or "{}").get("items", [])
+            except json.JSONDecodeError:
+                self._nodes = []
+        return self._nodes
+
+    def namespace_exists(self, namespace: str) -> bool:
+        return self.run(["get", "namespace", namespace]) is not None
+
+    def pods_in(self, namespace: str) -> list[str]:
+        out = self.run(["get", "pods", "-n", namespace, "--no-headers"])
+        return [ln for ln in (out or "").splitlines() if ln.strip()]
+
+    def events_in(self, namespace: str) -> list[str]:
+        out = self.run(["get", "events", "-n", namespace, "--sort-by=.lastTimestamp"])
+        return [ln for ln in (out or "").splitlines() if ln.strip()]
+
+    def all_events(self) -> list[str]:
+        out = self.run(["get", "events", "-A", "--sort-by=.lastTimestamp"])
+        return [ln for ln in (out or "").splitlines() if ln.strip()]
+
+    def machines(self) -> list[dict[str, Any]]:
+        out = self.run(["get", "machines", "-n", "openshift-machine-api", "-o", "json"])
+        try:
+            return json.loads(out or "{}").get("items", [])
+        except json.JSONDecodeError:
+            return []
+
+
+# === PROMETHEUS CLIENT =====================================================
+
+
+class PrometheusClient:
+    """Minimal Prometheus/Thanos client over urllib (unverified TLS, like
+    the bash script's `curl -sk`)."""
+
+    def __init__(self, oc: Oc, token: str = "", verbose: bool = False) -> None:
+        self._oc = oc
+        self.verbose = verbose
+        self._base: str | None = None
+        self._base_resolved = False
+        self._token: str | None = token or None
+        self._token_resolved = bool(token)
+
+    def _base_url(self) -> str | None:
+        if not self._base_resolved:
+            self._base_resolved = True
+            override = os.environ.get(PROM_URL_OVERRIDE, "")
+            if override:
+                self._base = override.rstrip("/")
+            else:
+                host = self._oc.route_host()
+                self._base = f"https://{host}" if host else None
+        return self._base
+
+    def _bearer(self) -> str:
+        if not self._token_resolved:
+            self._token_resolved = True
+            self._token = self._oc.whoami_token() or self._oc.create_prometheus_token()
+        return self._token or ""
+
+    def _get_json(self, path: str, params: dict[str, str], timeout: float) -> dict[str, Any] | None:
+        base = self._base_url()
+        if base is None:
+            return None
+        url = f"{base}{path}?{urllib.parse.urlencode(params)}"
+        request = urllib.request.Request(url, headers={"Authorization": f"Bearer {self._bearer()}"})
+        try:
+            with urllib.request.urlopen(
+                request, timeout=timeout, context=_UNVERIFIED_CTX
+            ) as response:
+                data = json.loads(response.read().decode())
+        except (urllib.error.URLError, OSError, ValueError) as exc:
+            if self.verbose:
+                log_warn(f"Prometheus request failed: {exc}")
+            return None
+        if not isinstance(data, dict) or data.get("status") != "success":
+            if self.verbose:
+                log_warn(f"Prometheus query was not successful: {path}")
+            return None
+        return data
+
+    def query(self, promql: str) -> float | None:
+        """Instant query; returns the first series' value or None."""
+        data = self._get_json("/api/v1/query", {"query": promql}, QUERY_TIMEOUT)
+        if data is None:
+            return None
+        result = data.get("data", {}).get("result", [])
+        if not result:
+            return None
+        try:
+            value = float(result[0]["value"][1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) else None
+
+    def query_all(self, promql: str) -> list[dict[str, Any]] | None:
+        """Instant query; returns every result series (or None on failure)."""
+        data = self._get_json("/api/v1/query", {"query": promql}, QUERY_TIMEOUT)
+        if data is None:
+            return None
+        return data.get("data", {}).get("result", [])
+
+    def query_range(
+        self, promql: str, start_s: int, end_s: int, step_s: int = STEP_SECONDS
+    ) -> list[dict[str, Any]] | None:
+        """Range query; returns every result series with its `values` matrix."""
+        data = self._get_json(
+            "/api/v1/query_range",
+            {"query": promql, "start": str(start_s), "end": str(end_s), "step": str(step_s)},
+            RANGE_TIMEOUT,
+        )
+        if data is None:
+            return None
+        return data.get("data", {}).get("result", [])
+
+
+def _to_floats(raw_values: list[Any]) -> list[float]:
+    """Convert Prometheus sample values, dropping non-finite garbage."""
+    out: list[float] = []
+    for raw in raw_values:
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            out.append(value)
+    return out
+
+
+def _series_points(series: list[dict[str, Any]] | None) -> list[float]:
+    """Flatten a query_range matrix into a pooled list of sample values."""
+    if not series:
+        return []
+    points: list[float] = []
+    for entry in series:
+        points.extend(_to_floats([v for _, v in entry.get("values", [])]))
+    return points
+
+
+def _series_node(metric: dict[str, Any]) -> str:
+    """Node name for a series: the `node` label, else `instance` sans port."""
+    node = str(metric.get("node") or metric.get("instance") or "")
+    return re.sub(r":[0-9]+$", "", node)
+
+
+# === NODE DATA =============================================================
+
+
+@dataclass(frozen=True)
+class GpuNode:
+    name: str
+    vendor: str
+    gpu_count: int
+    instance_type: str
+
+
+def gpu_nodes_from_items(items: list[dict[str, Any]]) -> list[GpuNode]:
+    """Nodes with nvidia.com/gpu or amd.com/gpu capacity (as in the bash
+    script's get_all_gpu_node_data)."""
+    gpu_nodes: list[GpuNode] = []
+    for item in items:
+        meta = item.get("metadata", {})
+        capacity = item.get("status", {}).get("capacity", {})
+        labels = meta.get("labels", {})
+        nvidia = capacity.get("nvidia.com/gpu")
+        amd = capacity.get("amd.com/gpu")
+        if nvidia is None and amd is None:
+            continue
+        if nvidia is not None:
+            vendor, count = "NVIDIA", nvidia
+        else:
+            vendor, count = "AMD", amd
+        try:
+            gpu_count = int(count)
+        except (TypeError, ValueError):
+            gpu_count = 0
+        gpu_nodes.append(
+            GpuNode(
+                name=str(meta.get("name", "")),
+                vendor=vendor,
+                gpu_count=gpu_count,
+                instance_type=str(labels.get("node.kubernetes.io/instance-type", "")),
+            )
+        )
+    return gpu_nodes
+
+
+def node_instance_type(item: dict[str, Any]) -> str:
+    labels = item.get("metadata", {}).get("labels", {})
+    return str(labels.get("node.kubernetes.io/instance-type", ""))
+
+
+def cluster_short_name(server: str) -> str:
+    """First DNS label after "api." in the server URL (for machine naming)."""
+    match = re.search(r"api\.([^:]+)", server)
+    if not match:
+        return ""
+    return match.group(1).split(".")[0]
+
+
+def instant_averages(top_lines: list[str]) -> tuple[float | None, float | None]:
+    """Average CPU% (column 3) and MEM% (column 5) from `oc adm top nodes`."""
+    cpu_values: list[float] = []
+    mem_values: list[float] = []
+    for line in top_lines:
+        fields = line.split()
+        if len(fields) < 5:
+            continue
+        try:
+            cpu_values.append(float(fields[2].rstrip("%")))
+            mem_values.append(float(fields[4].rstrip("%")))
+        except ValueError:
+            continue
+    cpu_avg = sum(cpu_values) / len(cpu_values) if cpu_values else None
+    mem_avg = sum(mem_values) / len(mem_values) if mem_values else None
+    return cpu_avg, mem_avg
+
+
+def fmt2(value: float | None) -> str | None:
+    """Two-decimal string, matching the bash script's printf %.2f output."""
+    return f"{value:.2f}" if value is not None else None
+
+
+# === SPIKE/SHAPE RULE ======================================================
+
+
+@dataclass(frozen=True)
+class ShapeStats:
+    """Result of the peak + variance ("shape") evaluation."""
+
+    points: int
+    peak: float
+    baseline: float  # median of windows (query_range) or window mean (fallback)
+    ratio: float | None  # peak / baseline; None when the baseline is zero
+    peak_exceeded: bool
+    shape_exceeded: bool
+
+    @property
+    def active(self) -> bool:
+        return self.peak_exceeded or self.shape_exceeded
+
+
+def evaluate_shape(
+    points: list[float],
+    *,
+    peak_threshold: float,
+    ratio_threshold: float,
+    floor: float,
+) -> ShapeStats:
+    """The spike/shape rule: ACTIVE when any window exceeded `peak_threshold`,
+    or when the peak is `ratio_threshold` times the baseline while reaching
+    `floor` (so a quiet baseline cannot trip the ratio on its own).
+
+    A zero baseline with a nonzero peak counts as an unbounded ratio, gated
+    by the floor just the same.
+    """
+    if not points:
+        return ShapeStats(0, 0.0, 0.0, None, False, False)
+    peak = max(points)
+    baseline = statistics.median(points)
+    ratio = peak / baseline if baseline > 0 else None
+    peak_exceeded = peak > peak_threshold
+    shape_exceeded = peak > 0 and peak >= floor and (ratio is None or ratio > ratio_threshold)
+    return ShapeStats(len(points), peak, baseline, ratio, peak_exceeded, shape_exceeded)
+
+
+@dataclass(frozen=True)
+class CheckOutcome:
+    """One criterion's verdict plus its criteria JSON entry."""
+
+    result: str  # IDLE | ACTIVE | UNKNOWN | N/A
+    entry: dict[str, Any]
+    counted: bool  # counts toward the 80% denominator
+
+
+def _shape_entry(stats: ShapeStats) -> dict[str, Any]:
+    """JSON detail for a spike/shape evaluation (additive to result/value)."""
+    return {
+        "peak": round(stats.peak, 2),
+        "baseline": round(stats.baseline, 2),
+        "ratio": round(stats.ratio, 2) if stats.ratio is not None else None,
+        "points": stats.points,
+        "peak_exceeded": stats.peak_exceeded,
+        "shape_exceeded": stats.shape_exceeded,
+    }
+
+
+# === CRITERIA ==============================================================
+
+
+def check_cpu(
+    cfg: Config,
+    prom: PrometheusClient,
+    live_nodes: set[str],
+    instant_cpu: float | None,
+) -> CheckOutcome:
+    """CPU criterion: spike/shape rule on 15-minute windows, with the legacy
+    window-average as fallback and the one-directional instant override."""
+    entry: dict[str, Any] = {"result": "UNKNOWN", "value": None}
+    stats: ShapeStats | None = None
+    windowed: float | None = None
+
+    if cfg.time_window_minutes > 0:
+        end_s = int(time.time())
+        start_s = end_s - cfg.time_window_minutes * 60
+        series = prom.query_range(CPU_RANGE_QUERY, start_s, end_s)
+        # Only nodes that still exist count: series from deleted nodes are
+        # real history but say nothing about the cluster as it stands.
+        points = [
+            value
+            for s in series or []
+            if _series_node(s.get("metric", {})) in live_nodes
+            for value in _to_floats([v for _, v in s.get("values", [])])
+        ]
+        if points:
+            stats = evaluate_shape(
+                points,
+                peak_threshold=cfg.cpu_peak_threshold,
+                ratio_threshold=cfg.cpu_shape_ratio,
+                floor=cfg.cpu_shape_floor,
+            )
+        else:
+            log_info("CPU query_range matrix unavailable; using legacy window average")
+            windowed = prom.query(
+                f'(1 - avg(rate(node_cpu_seconds_total{{mode="idle"}}'
+                f"[{cfg.time_window_minutes}m]))) * 100"
+            )
+
+    active = False
+    source = None
+    if stats is not None:
+        active = stats.active
+        source = f"spike/shape over {SPIKE_WINDOW_MINUTES}m windows"
+        entry.update(_shape_entry(stats))
+    elif windowed is not None:
+        active = windowed >= cfg.cpu_idle_threshold
+        source = "legacy window average"
+        entry["window_average"] = round(windowed, 2)
+    elif instant_cpu is not None:
+        active = instant_cpu >= cfg.cpu_idle_threshold
+        source = "instant"
+    else:
+        # No data at all: UNKNOWN, but still counted (bash parity).
+        entry["value"] = fmt2(instant_cpu)
+        entry["instant"] = instant_cpu
+        return CheckOutcome("UNKNOWN", entry, counted=True)
+
+    # One-directional instant override: a live spike beats an idle verdict.
+    instant_override = False
+    if not active and instant_cpu is not None and instant_cpu >= cfg.cpu_idle_threshold:
+        active = True
+        instant_override = True
+
+    value = stats.peak if stats is not None else (windowed if windowed is not None else instant_cpu)
+    entry["result"] = "ACTIVE" if active else "IDLE"
+    entry["value"] = fmt2(value)
+    entry["instant"] = instant_cpu
+    entry["instant_override"] = instant_override
+    entry["source"] = source
+    return CheckOutcome(entry["result"], entry, counted=True)
+
+
+def check_memory(cfg: Config, prom: PrometheusClient, instant_mem: float | None) -> CheckOutcome:
+    """Memory criterion: legacy window average with instant override."""
+    entry: dict[str, Any] = {"result": "UNKNOWN", "value": None}
+    windowed: float | None = None
+    if cfg.time_window_minutes > 0:
+        windowed = prom.query(
+            "(1 - avg_over_time((sum(node_memory_MemAvailable_bytes) / "
+            f"sum(node_memory_MemTotal_bytes))[{cfg.time_window_minutes}m:])) * 100"
+        )
+
+    if windowed is None and instant_mem is None:
+        entry["value"] = None
+        return CheckOutcome("UNKNOWN", entry, counted=True)
+
+    active = False
+    if windowed is not None:
+        active = windowed >= cfg.memory_idle_threshold
+    instant_override = False
+    if not active and instant_mem is not None and instant_mem >= cfg.memory_idle_threshold:
+        active = True
+        instant_override = True
+
+    value = windowed if windowed is not None else instant_mem
+    entry["result"] = "ACTIVE" if active else "IDLE"
+    entry["value"] = fmt2(value)
+    entry["instant"] = instant_mem
+    entry["instant_override"] = instant_override
+    return CheckOutcome(entry["result"], entry, counted=True)
+
+
+def check_api(cfg: Config, prom: PrometheusClient) -> CheckOutcome:
+    """API criterion: window-average rate against the threshold, plus a
+    spike detector (peak vs median of 15-minute windows)."""
+    entry: dict[str, Any] = {"result": "UNKNOWN", "value": None}
+    if cfg.time_window_minutes > 0:
+        avg = prom.query(f"sum(rate(apiserver_request_total[{cfg.time_window_minutes}m]))")
+        end_s = int(time.time())
+        start_s = end_s - cfg.time_window_minutes * 60
+        series = prom.query_range(API_RANGE_QUERY, start_s, end_s)
+        spike_points = _series_points(series)
+        stats: ShapeStats | None = None
+        if spike_points:
+            # Only the ratio branch applies here; the absolute-threshold
+            # branch is the windowed average checked above.
+            stats = evaluate_shape(
+                spike_points,
+                peak_threshold=math.inf,
+                ratio_threshold=cfg.api_spike_ratio,
+                floor=cfg.api_spike_floor,
+            )
+    else:
+        avg = prom.query("sum(rate(apiserver_request_total[5m]))")
+        stats = None
+
+    if avg is None and stats is None:
+        return CheckOutcome("UNKNOWN", entry, counted=False)
+
+    active = (avg is not None and avg >= cfg.api_threshold) or (
+        stats is not None and stats.shape_exceeded
+    )
+    entry["result"] = "ACTIVE" if active else "IDLE"
+    entry["value"] = fmt2(avg)
+    if stats is not None:
+        entry["spike_peak"] = round(stats.peak, 2)
+        entry["spike_baseline"] = round(stats.baseline, 2)
+        entry["spike_ratio"] = round(stats.ratio, 2) if stats.ratio is not None else None
+        entry["spike_active"] = stats.shape_exceeded
+    return CheckOutcome(entry["result"], entry, counted=True)
+
+
+def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode]) -> CheckOutcome:
+    """GPU criterion: spike/shape rule on DCGM GPU utilization.  N/A (not
+    counted) without GPU nodes or DCGM metrics."""
+    entry: dict[str, Any] = {"result": "N/A", "value": None}
+    if not gpu_nodes:
+        entry["reason"] = "no GPU nodes"
+        return CheckOutcome("N/A", entry, counted=False)
+    if cfg.time_window_minutes <= 0:
+        entry["reason"] = "no time window"
+        return CheckOutcome("N/A", entry, counted=False)
+
+    end_s = int(time.time())
+    start_s = end_s - cfg.time_window_minutes * 60
+    series = prom.query_range(GPU_RANGE_QUERY, start_s, end_s)
+    points = _series_points(series)
+
+    stats: ShapeStats | None = None
+    source = f"spike/shape over {SPIKE_WINDOW_MINUTES}m windows"
+    if points:
+        stats = evaluate_shape(
+            points,
+            peak_threshold=cfg.gpu_peak_threshold,
+            ratio_threshold=cfg.gpu_shape_ratio,
+            floor=cfg.gpu_shape_floor,
+        )
+    else:
+        # Aggregate fallback: whole-window max/avg per series.  All exporter
+        # series are pooled - a deleted node's samples are still activity.
+        peaks = _to_floats(
+            [
+                s.get("value", [None, None])[1]
+                for s in prom.query_all(
+                    f"max_over_time(DCGM_FI_DEV_GPU_UTIL[{cfg.time_window_minutes}m])"
+                )
+                or []
+            ]
+        )
+        avgs = _to_floats(
+            [
+                s.get("value", [None, None])[1]
+                for s in prom.query_all(
+                    f"avg_over_time(DCGM_FI_DEV_GPU_UTIL[{cfg.time_window_minutes}m])"
+                )
+                or []
+            ]
+        )
+        if peaks:
+            peak = max(peaks)
+            baseline = sum(avgs) / len(avgs) if avgs else 0.0
+            ratio = peak / baseline if baseline > 0 else None
+            stats = ShapeStats(
+                points=len(peaks) + len(avgs),
+                peak=peak,
+                baseline=baseline,
+                ratio=ratio,
+                peak_exceeded=peak > cfg.gpu_peak_threshold,
+                shape_exceeded=(
+                    peak > 0
+                    and peak >= cfg.gpu_shape_floor
+                    and (ratio is None or ratio > cfg.gpu_shape_ratio)
+                ),
+            )
+            source = "window aggregates fallback"
+        else:
+            entry["reason"] = "no DCGM metrics"
+            return CheckOutcome("N/A", entry, counted=False)
+
+    entry["result"] = "ACTIVE" if stats.active else "IDLE"
+    entry["value"] = fmt2(stats.peak)
+    entry.update(_shape_entry(stats))
+    entry["source"] = source
+    return CheckOutcome(entry["result"], entry, counted=True)
+
+
+def convert_age_to_days(age: str) -> int:
+    """Parse oc's AGE column ("12d", "5h", "30m") into days."""
+    match = AGE_RE.match(age)
+    if match:
+        return int(match.group(1))
+    return 0  # h/m/s all round to zero days
+
+
+def check_operators(cfg: Config, oc: Oc) -> CheckOutcome:
+    """Operators criterion: old pods with few recent reconciliation events.
+
+    The pod AGE is taken from the LAST field of each line: oc renders
+    RESTARTS as "N (Nd ago)" on restarted pods, which shifts AGE out of the
+    fixed column the bash script read (its known bug, fixed here).
+    """
+    entry: dict[str, Any] = {"result": "N/A", "age_days": 0}
+    namespaces = [ns.strip() for ns in cfg.operator_namespaces.split(",") if ns.strip()]
+
+    oldest_days = 0
+    found: list[str] = []
+    existing: list[str] = []
+    for namespace in namespaces:
+        if not oc.namespace_exists(namespace):
+            continue
+        existing.append(namespace)
+        # Parity with the bash script: only the first five matching pods per
+        # namespace are considered.
+        matching = [ln for ln in oc.pods_in(namespace) if POD_RE.search(ln)][:5]
+        if not matching:
+            continue
+        found.append(namespace)
+        for line in matching:
+            fields = line.split()
+            if fields:
+                oldest_days = max(oldest_days, convert_age_to_days(fields[-1]))
+
+    if not found:
+        return CheckOutcome("N/A", entry, counted=False)
+
+    events = 0
+    for namespace in existing:
+        # oc sorts by lastTimestamp; only the most recent 20 events count.
+        for line in oc.events_in(namespace)[-20:]:
+            if OPERATOR_EVENT_RE.search(line):
+                events += 1
+
+    idle = oldest_days >= cfg.operator_age_days and events < OPERATOR_EVENT_THRESHOLD
+    entry["result"] = "IDLE" if idle else "ACTIVE"
+    entry["age_days"] = oldest_days
+    entry["events"] = events
+    entry["namespaces"] = found
+    return CheckOutcome(entry["result"], entry, counted=True)
+
+
+def compute_verdict(outcomes: list[CheckOutcome]) -> tuple[int, int, int, str, int]:
+    """The 80% rule: IDLE when the IDLE votes reach int(total * 0.80).
+
+    Uncounted criteria (N/A / UNKNOWN-with-decrement) shrink the
+    denominator; cpu and memory UNKNOWN still count, matching the bash
+    script's bookkeeping.
+    """
+    total = sum(1 for outcome in outcomes if outcome.counted)
+    met = sum(1 for outcome in outcomes if outcome.result == "IDLE")
+    threshold = int(total * 0.80)
+    status = "IDLE" if met >= threshold else "ACTIVE"
+    exit_code = 1 if status == "IDLE" else 0
+    return total, met, threshold, status, exit_code
+
+
+# === INFORMATIONAL (non-voting) SECTIONS ===================================
+
+
+def gpu_usage_section(
+    cfg: Config, oc: Oc, prom: PrometheusClient, gpu_nodes: list[GpuNode]
+) -> dict[str, Any]:
+    """GPU node CPU/memory usage for the report (node resources, not GPU
+    utilization - that now lives in the gpu criterion)."""
+    cpu_current: list[float] = []
+    mem_current: list[float] = []
+    for node in gpu_nodes:
+        for line in oc.top_node(node.name):
+            fields = line.split()
+            if len(fields) < 5:
+                continue
+            try:
+                cpu_current.append(float(fields[2].rstrip("%")))
+                mem_current.append(float(fields[4].rstrip("%")))
+            except ValueError:
+                continue
+
+    cpu_windowed: list[float] = []
+    mem_windowed: list[float] = []
+    if cfg.time_window_minutes > 0:
+        for node in gpu_nodes:
+            pattern = f"{re.escape(node.name)}.*"
+            cpu = prom.query(
+                '(1 - avg(rate(node_cpu_seconds_total{mode="idle",'
+                f'instance=~"{pattern}"}}[{cfg.time_window_minutes}m]))) * 100'
+            )
+            if cpu is not None:
+                cpu_windowed.append(cpu)
+            mem = prom.query(
+                "(1 - avg_over_time((avg(node_memory_MemAvailable_bytes"
+                f'{{instance=~"{pattern}"}}) / avg(node_memory_MemTotal_bytes'
+                f'{{instance=~"{pattern}"}}))[{cfg.time_window_minutes}m:])) * 100'
+            )
+            if mem is not None:
+                mem_windowed.append(mem)
+
+    def _avg(values: list[float]) -> float | None:
+        return sum(values) / len(values) if values else None
+
+    return {
+        "cpu_current": fmt2(_avg(cpu_current)),
+        "memory_current": fmt2(_avg(mem_current)),
+        "cpu_windowed": fmt2(_avg(cpu_windowed)),
+        "memory_windowed": fmt2(_avg(mem_windowed)),
+    }
+
+
+def ml_node_report(
+    cfg: Config, oc: Oc, prom: PrometheusClient, items: list[dict[str, Any]]
+) -> bool:
+    """Verbose-only ML node usage display (informational, never votes).
+
+    Returns whether any ML/GPU instance-type nodes were found.
+    """
+    pattern = re.compile(cfg.ml_node_pattern)
+    ml_nodes = [item for item in items if pattern.search(node_instance_type(item))]
+    if not ml_nodes:
+        log_info("No ML/GPU instance-type nodes found")
+        return False
+
+    log_info(f"Found {len(ml_nodes)} ML/GPU instance-type nodes:")
+    for item in ml_nodes:
+        name = item.get("metadata", {}).get("name", "")
+        instance = node_instance_type(item)
+        cpu = mem = None
+        for line in oc.top_node(str(name)):
+            fields = line.split()
+            if len(fields) >= 5:
+                try:
+                    cpu = float(fields[2].rstrip("%"))
+                    mem = float(fields[4].rstrip("%"))
+                except ValueError:
+                    pass
+        windowed = None
+        if cfg.time_window_minutes > 0:
+            windowed = prom.query(
+                f'(1 - avg(rate(node_cpu_seconds_total{{mode="idle",'
+                f'instance=~"{re.escape(str(name))}.*"}}'
+                f"[{cfg.time_window_minutes}m]))) * 100"
+            )
+        log_info(
+            f"  {name} ({instance}): instant cpu={fmt2(cpu)}% "
+            f"mem={fmt2(mem)}%, windowed cpu={fmt2(windowed)}%"
+        )
+    return True
+
+
+def recent_activity_report(oc: Oc, event_minutes: int) -> None:
+    """Verbose-only recent pod activity display."""
+    lines = oc.all_events()
+    recent = [ln for ln in lines if RECENT_ACTIVITY_RE.search(ln)]
+    count = len(recent)
+    log_info(f"Pod-related events in the last {event_minutes} minutes: {count}")
+    for line in recent[-5:]:
+        log_info(f"  {line}")
+
+
+def gpu_machines_report(oc: Oc, server: str) -> None:
+    """Verbose-only GPU machine display for clusters without GPU nodes."""
+    short = cluster_short_name(server)
+    if not short:
+        return
+    pattern = re.compile(f"{re.escape(short)}-.*-gpu-")
+    machines = [
+        m for m in oc.machines() if pattern.search(str(m.get("metadata", {}).get("name", "")))
+    ]
+    if machines:
+        log_info(f"GPU machines exist in openshift-machine-api: {len(machines)}")
+    else:
+        log_info("No GPU machines found in openshift-machine-api")
+
+
+# === REPORT / EXPORT =======================================================
+
+CSV_HEADER = (
+    "timestamp,cluster,status,cpu_result,cpu_value,memory_result,memory_value,"
+    "api_server_result,api_server_value,gpu_result,gpu_value,operators_result,"
+    "operator_age_days,criteria_met,total_criteria,time_window_minutes,"
+    "has_gpu_nodes,gpu_node_count,gpu_flavors,gpu_node_age,gpu_cpu_current,"
+    "gpu_mem_current,gpu_cpu_windowed,gpu_mem_windowed"
+)
+
+
+def export_csv(report: dict[str, Any], path: Path) -> None:
+    """Append one result row; write the header only for a new file."""
+    gpu = report["gpu"]
+    criteria = report["criteria"]
+    row = [
+        report["timestamp"],
+        report["cluster"],
+        report["status"],
+        criteria["cpu"]["result"],
+        criteria["cpu"]["value"] or "N/A",
+        criteria["memory"]["result"],
+        criteria["memory"]["value"] or "N/A",
+        criteria["api_server"]["result"],
+        criteria["api_server"]["value"] or "N/A",
+        criteria["gpu"]["result"],
+        criteria["gpu"]["value"] or "N/A",
+        criteria["operators"]["result"],
+        criteria["operators"]["age_days"],
+        criteria["met"],
+        criteria["total"],
+        report["configuration"]["time_window_minutes"],
+        "true" if gpu["has_gpu_nodes"] else "false",
+        gpu["node_count"],
+        gpu["flavors"] or "N/A",
+        gpu["node_age"] or "N/A",
+        gpu["usage"]["cpu_current"] or "N/A",
+        gpu["usage"]["memory_current"] or "N/A",
+        gpu["usage"]["cpu_windowed"] or "N/A",
+        gpu["usage"]["memory_windowed"] or "N/A",
+    ]
+    is_new = not path.exists()
+    with path.open("a", newline="") as fh:
+        if is_new:
+            fh.write(CSV_HEADER + "\n")
+        fh.write(",".join(str(field) for field in row) + "\n")
+
+
+def export_json(report: dict[str, Any], path: Path) -> None:
+    with path.open("w") as fh:
+        json.dump(report, fh, indent=2)
+        fh.write("\n")
+
+
+# === MAIN ==================================================================
+
+
+def run(argv: list[str] | None = None) -> int:
+    cfg = parse_args(argv)
+    set_verbose(cfg.verbose)
+
+    if cfg.verbose:
+        print("=" * 40, file=sys.stderr)
+        print("  OpenShift Cluster Idle Detection", file=sys.stderr)
+        print("=" * 40, file=sys.stderr)
+        log_info(f"Time window: {cfg.time_window_minutes} minutes")
+        log_info(f"Event history: {cfg.event_history_minutes} minutes")
+
+    if cfg.debug_probe:
+        log_info(
+            "--debug-probe is accepted for compatibility; the criteria "
+            "detail is always included in the JSON export now"
+        )
+
+    if shutil.which("oc") is None:
+        log_error("oc command not found")
+        return 2
+    oc = Oc(verbose=cfg.verbose)
+    if not oc.logged_in():
+        log_error("Not logged in to an OpenShift cluster (oc whoami failed)")
+        return 2
+
+    prom = PrometheusClient(oc, token=cfg.token, verbose=cfg.verbose)
+    server = oc.whoami_server()
+    log_info(f"Cluster: {server}")
+    log_info(f"Prometheus token: {'provided' if cfg.token else 'resolved via oc'}")
+
+    node_items = oc.nodes()
+    live_nodes = {str(item.get("metadata", {}).get("name", "")) for item in node_items}
+    gpu_nodes = gpu_nodes_from_items(node_items)
+    instant_cpu, instant_mem = instant_averages(oc.top_nodes())
+
+    log_info(f"Nodes: {len(live_nodes)} ({len(gpu_nodes)} with GPUs)")
+    log_info(f"Instant cluster CPU: {fmt2(instant_cpu)}%, memory: {fmt2(instant_mem)}%")
+
+    # --- CHECK 1: CPU ---
+    log_info("--- CHECK 1: CPU Utilization ---")
+    cpu_outcome = check_cpu(cfg, prom, live_nodes, instant_cpu)
+    log_info(f"CPU Result: {cpu_outcome.result}")
+
+    # --- CHECK 2: Memory ---
+    log_info("--- CHECK 2: Memory Utilization ---")
+    memory_outcome = check_memory(cfg, prom, instant_mem)
+    log_info(f"Memory Result: {memory_outcome.result}")
+
+    # --- CHECK 3: API server ---
+    log_info("--- CHECK 3: API Server Activity ---")
+    api_outcome = check_api(cfg, prom)
+    log_info(f"API Server Result: {api_outcome.result}")
+
+    # --- CHECK 4: GPU ---
+    log_info("--- CHECK 4: GPU Utilization ---")
+    gpu_outcome = check_gpu(cfg, prom, gpu_nodes)
+    log_info(f"GPU Result: {gpu_outcome.result}")
+
+    # --- CHECK 5: Operators ---
+    log_info("--- CHECK 5: Operators ---")
+    operators_outcome = check_operators(cfg, oc)
+    log_info(f"Operators Result: {operators_outcome.result}")
+
+    # --- Informational (never votes) ---
+    ml_found = False
+    if cfg.check_ml_nodes:
+        ml_found = ml_node_report(cfg, oc, prom, node_items)
+    if cfg.verbose:
+        recent_activity_report(oc, cfg.event_history_minutes)
+        if not gpu_nodes:
+            gpu_machines_report(oc, server)
+
+    # --- GPU report section (informational usage numbers) ---
+    flavors = sorted({f"{n.vendor}({n.instance_type})" for n in gpu_nodes})
+    gpu_section: dict[str, Any] = {
+        "has_gpu_nodes": bool(gpu_nodes),
+        "node_count": len(gpu_nodes),
+        "flavors": ",".join(flavors) if flavors else None,
+        "node_age": None,
+        "usage": gpu_usage_section(cfg, oc, prom, gpu_nodes)
+        if gpu_nodes
+        else {
+            "cpu_current": None,
+            "memory_current": None,
+            "cpu_windowed": None,
+            "memory_windowed": None,
+        },
+    }
+
+    # --- Verdict ---
+    outcomes = [cpu_outcome, memory_outcome, api_outcome, gpu_outcome, operators_outcome]
+    total, met, threshold, status, exit_code = compute_verdict(outcomes)
+
+    now = datetime.now(UTC)
+    report: dict[str, Any] = {
+        "timestamp": now.isoformat(timespec="seconds"),
+        "timestamp_human": now.strftime("%a %b %d %H:%M:%S UTC %Y"),
+        "cluster": server,
+        "status": status,
+        "exit_code": exit_code,
+        "configuration": {
+            "time_window_minutes": cfg.time_window_minutes,
+            "cpu_threshold": cfg.cpu_idle_threshold,
+            "memory_threshold": cfg.memory_idle_threshold,
+            "api_threshold": cfg.api_threshold,
+            "operator_age_threshold_days": cfg.operator_age_days,
+            "cpu_peak_threshold": cfg.cpu_peak_threshold,
+            "cpu_shape_ratio": cfg.cpu_shape_ratio,
+            "cpu_shape_floor": cfg.cpu_shape_floor,
+            "gpu_peak_threshold": cfg.gpu_peak_threshold,
+            "gpu_shape_ratio": cfg.gpu_shape_ratio,
+            "gpu_shape_floor": cfg.gpu_shape_floor,
+            "api_spike_ratio": cfg.api_spike_ratio,
+            "api_spike_floor": cfg.api_spike_floor,
+        },
+        "criteria": {
+            "total": total,
+            "met": met,
+            "threshold": threshold,
+            "cpu": cpu_outcome.entry,
+            "memory": memory_outcome.entry,
+            "api_server": api_outcome.entry,
+            "gpu": gpu_outcome.entry,
+            "operators": operators_outcome.entry,
+        },
+        "gpu": gpu_section,
+    }
+
+    # --- Summary ---
+    if cfg.verbose:
+        print("-" * 40, file=sys.stderr)
+        log_info(f"Idle criteria met: {met} / {total} (threshold: {threshold})")
+        for name, outcome in zip(
+            ("cpu", "memory", "api_server", "gpu", "operators"), outcomes, strict=True
+        ):
+            log_info(f"  {name}: {outcome.result}")
+    if status == "IDLE" and (gpu_nodes or ml_found):
+        log_warn("Expensive GPU/ML nodes are idle - review before cleanup")
+
+    if cfg.verbose:
+        if status == "IDLE":
+            print(f"{GREEN}========================================{NC}", file=sys.stderr)
+            print(f"{GREEN}  Cluster Status: IDLE{NC}", file=sys.stderr)
+            print(f"{GREEN}========================================{NC}", file=sys.stderr)
+        else:
+            print(f"{YELLOW}========================================{NC}", file=sys.stderr)
+            print(f"{YELLOW}  Cluster Status: ACTIVE{NC}", file=sys.stderr)
+            print(f"{YELLOW}========================================{NC}", file=sys.stderr)
+
+    # Quiet-mode result lines (stdout, matching the bash script's format).
+    print(f"CPU: {cpu_outcome.result}")
+    print(f"Memory: {memory_outcome.result}")
+    if api_outcome.result != "UNKNOWN":
+        print(f"API Server: {api_outcome.result}")
+    print(f"GPU: {gpu_outcome.result}")
+    print(f"Operators: {operators_outcome.result}")
+    print(f"STATUS: {status}")
+
+    if cfg.csv_path is not None:
+        export_csv(report, cfg.csv_path)
+        log_info(f"CSV exported to {cfg.csv_path}")
+    if cfg.json_path is not None:
+        export_json(report, cfg.json_path)
+        log_info(f"JSON exported to {cfg.json_path}")
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    sys.exit(run())
