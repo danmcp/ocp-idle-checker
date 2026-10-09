@@ -323,3 +323,28 @@ def test_shim_missing_oc_exits_2(monkeypatch):
     proc = run_shim(["-q"])
     assert proc.returncode == 2
     assert "oc command not found" in proc.stderr
+
+
+def test_shim_without_python3_exits_2(monkeypatch, tmp_path):
+    # No python3 anywhere on PATH: exit 2, not exec's 127.  The guards run
+    # before the SCRIPT_DIR resolution on purpose - dirname is an external
+    # binary and would also be missing from a stripped PATH.
+    monkeypatch.setenv("PATH", str(tmp_path))
+    proc = run_shim(["-q"])
+    assert proc.returncode == 2
+    assert "python3 not found" in proc.stderr
+
+
+def test_shim_old_python3_exits_2(monkeypatch, tmp_path):
+    # A too-old python3 must fail with 2; a Python traceback would exit 1,
+    # which callers would misread as IDLE.
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    fake_python = fake_bin / "python3"
+    fake_python.write_text("#!/bin/bash\necho 'Python 3.6.9'\nexit 1\n")
+    fake_python.chmod(0o755)
+    monkeypatch.setenv("PATH", str(fake_bin))
+    proc = run_shim(["-q"])
+    assert proc.returncode == 2
+    assert "python3 >= 3.12 required" in proc.stderr
+    assert "Python 3.6.9" in proc.stderr
