@@ -70,9 +70,10 @@ def test_variance_rule_flags():
 
 
 def test_removed_and_renamed_variance_flags_are_rejected():
-    # The variance floors were removed outright, and the ratio/floor flags
-    # were renamed to *-variance-*; old spellings must fail loudly rather
-    # than be silently ignored.
+    # The API variance floor flag was removed outright (the CPU/GPU floors
+    # are module constants, never flags), and the ratio/floor flags were
+    # renamed to *-variance-*; old spellings must fail loudly rather than
+    # be silently ignored.
     with pytest.raises(SystemExit):
         oic.parse_args(["--cpu-shape-floor", "20"])
     with pytest.raises(SystemExit):

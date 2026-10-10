@@ -31,10 +31,10 @@ Each criterion is evaluated independently and can be `IDLE`, `ACTIVE`, `UNKNOWN`
 
 | Criterion | Votes ACTIVE when |
 |-----------|-------------------|
-| **CPU** | any node's 15-minute window > 30%, or any node's window peak clearing a baseline-scaled required peak (10× its own median at a 1% median, 2× at 50%); an instant `oc adm top nodes` reading ≥ 15% can also flip an otherwise-IDLE result |
+| **CPU** | any node's 15-minute window > 30%, or any node's window peak clearing a baseline-scaled required peak (10× its own median at a 1% median, 2× at 50%; 1% floor on a zero median); an instant `oc adm top nodes` reading ≥ 15% can also flip an otherwise-IDLE result |
 | **Memory** | the time-windowed average ≥ 35%, or an instant snapshot ≥ 35% (one-directional override) |
 | **API Server** | the time-windowed average ≥ 100 req/sec, or any 15-minute window clearing a baseline-scaled required peak (10× the median at a 1 req/s median, 2× at 50 req/s) |
-| **GPU** | any node's 15-minute window > 40%, or any node's window peak clearing a baseline-scaled required peak (DCGM GPU utilization) |
+| **GPU** | any node's 15-minute window > 40%, or any node's window peak clearing a baseline-scaled required peak (DCGM GPU utilization; 5% floor on a zero median) |
 | **Operators** | the median controller age is < 7 days, or ≥ 5 reconciliation events in the last 48 hours |
 
 A criterion votes IDLE when none of its ACTIVE conditions hold. Some criteria can instead be N/A — not counted in the denominator (see [Conditional Criteria](#conditional-criteria)).
@@ -50,7 +50,7 @@ The required peak follows one power law shared by all three variance rules, in e
 
 | node median | required multiple | required peak |
 |---|---|---|
-| 0% | any positive peak fires | — |
+| 0% | — | the floor: 1% (CPU) / 5% (GPU) |
 | 1% | 10× | 10% |
 | 2% | 7.5× | 15.0% |
 | 5% | 5.2× | 25.8% |
@@ -58,7 +58,7 @@ The required peak follows one power law shared by all three variance rules, in e
 | 20% | 2.9× | 58.3% |
 | 50% | 2× | 100% |
 
-The multiple is `variance-ratio` (default 2×) at a baseline of 50 and above; below, the variance rule is the sensitive branch. Above each criterion's normal threshold nothing needs the variance rule at all — a window over the peak threshold fires the peak rule (CPU/GPU), and an API median large enough to shallow the curve implies a windowed average over the request threshold — so the curve carries no cap. There is no floor either: a zero baseline demands only a positive peak. That is a deliberate trade: DCGM's 1-4% idle noise tail (kernel-residency blips from context init, ECC scrubbing, and health probes, not real use) now fires the GPU rule on zero-median exporters. Fleet calibration put the CPU peak threshold at 30%: the 30-40% max-peak band is sustained workloads the variance rule cannot see (a steady node sits near its own median), idle exemplars peak below 20%, and the highest one-off blip below 40% sits at 26.9%.
+The multiple is `variance-ratio` (default 2×) at a baseline of 50 and above; below, the variance rule is the sensitive branch. Above each criterion's normal threshold nothing needs the variance rule at all — a window over the peak threshold fires the peak rule (CPU/GPU), and an API median large enough to shallow the curve implies a windowed average over the request threshold — so the curve carries no cap. The CPU and GPU rules carry an absolute floor — 1% and 5% — that is the minimum required peak and the whole requirement on a zero median: DCGM's 1-4% idle noise tail (kernel-residency blips from context init, ECC scrubbing, and health probes, not real use) on a zero-median exporter stays idle under the 5% GPU floor. The API rule has no floor; a zero median there demands only a positive request rate. Fleet calibration put the CPU peak threshold at 30%: the 30-40% max-peak band is sustained workloads the variance rule cannot see (a steady node sits near its own median), idle exemplars peak below 20%, and the highest one-off blip below 40% sits at 26.9%.
 
 The criteria JSON detail exports each node's peak, median, ratio, required multiple, and required peak (`per_node`), with the cluster-level summary reporting the pooled peak plus the baseline/ratio of the node that came closest to (or furthest past) its own requirement (`node`, `required_ratio`, `required_peak`).
 

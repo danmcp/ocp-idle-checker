@@ -42,11 +42,14 @@ three variance rules share one law, in each criterion's native unit
 the baseline at a baseline of 1, falling to ratio_threshold times the
 baseline at a baseline of 50, with the required multiple following a
 power law in between, so quiet baselines need proportionally bigger
-bursts before they count as bursty.  There is no floor - a zero baseline
-demands only a positive peak - and no cap is needed: above each
-criterion's normal threshold (peak threshold for CPU/GPU, request
-threshold for the API server) those absolute branches fire first, so the
-variance rule never governs there.  "Baseline" is the
+bursts before they count as bursty.  The CPU (1%) and GPU (5%) rules
+carry an absolute floor - the minimum required peak, and the whole
+requirement on a zero baseline, where DCGM's 1-4% idle noise tail would
+otherwise read as an unbounded burst.  The API rule has no floor: a zero
+baseline there demands only a positive peak.  No cap is needed either:
+above each criterion's normal threshold (peak threshold for CPU/GPU,
+request threshold for the API server) those absolute branches fire
+first, so the variance rule never governs there.  "Baseline" is the
 median of the 15-minute windows on the query_range path and the window
 mean on the aggregate fallback path.
 
@@ -111,17 +114,20 @@ ML_NODE_PATTERN = "p5|p4d|g5"
 # Variance rule defaults - fleet-calibration knobs, ideal values TBD.
 CPU_PEAK_THRESHOLD = 30.0  # percent; any 15-min window above this = ACTIVE
 CPU_VARIANCE_RATIO = 2.0  # burst multiple required at a baseline of 50
+CPU_VARIANCE_FLOOR = 1.0  # percent; minimum peak the burst rule demands on a zero baseline
 GPU_PEAK_THRESHOLD = 40.0
 GPU_VARIANCE_RATIO = 2.0  # burst multiple required at a baseline of 50
+GPU_VARIANCE_FLOOR = 5.0  # percent; DCGM's idle noise tail reads 1-4% on a GPU doing nothing
 API_VARIANCE_RATIO = 2.0  # burst multiple required at a baseline of 50 req/s
 
 # The shared variance law, in each criterion's native unit: the required
 # multiple is 5x the ratio at a baseline of 1 (10x with the default 2x) and
 # falls to the ratio at VARIANCE_BASELINE_FULL, following a power law in
-# between.  No floor - a zero baseline demands only a positive peak - and
-# no cap: above each criterion's normal threshold the absolute branches
-# (window peak over the peak threshold, API windowed average over the
-# request threshold) fire first.
+# between.  A floor - the CPU/GPU constants above; the API rule has none -
+# is the minimum required peak and stands in for the whole curve on a zero
+# baseline.  No cap: above each criterion's normal threshold the absolute
+# branches (window peak over the peak threshold, API windowed average over
+# the request threshold) fire first.
 VARIANCE_BASELINE_FULL = 50.0  # baseline where the required multiple bottoms out at the ratio
 VARIANCE_CURVE_EXPONENT = math.log(5.0) / math.log(VARIANCE_BASELINE_FULL)
 
@@ -752,7 +758,7 @@ class VarianceStats:
         return self.peak_exceeded or self.variance_exceeded
 
 
-def variance_required_peak(baseline: float, ratio_threshold: float) -> float:
+def variance_required_peak(baseline: float, ratio_threshold: float, floor: float = 0.0) -> float:
     """Absolute window peak the variance rule demands at a baseline.
 
     One law shared by CPU, GPU, and the API server, in each criterion's
@@ -760,16 +766,20 @@ def variance_required_peak(baseline: float, ratio_threshold: float) -> float:
     required multiple is 5x ratio_threshold at a baseline of 1 (10x with
     the default 2x) and falls to ratio_threshold at a baseline of 50,
     following a power law in between, so quiet baselines need
-    proportionally bigger bursts before they count as bursty.  There is
-    no floor - a zero baseline demands only a positive peak.  No cap is
-    needed either: above each criterion's normal threshold (peak
-    threshold for CPU/GPU, request threshold for the API server) those
-    absolute branches fire first, so the curve never governs there.
+    proportionally bigger bursts before they count as bursty.  `floor` is
+    the minimum required peak and stands in for the whole curve on a zero
+    baseline: the CPU (1%) and GPU (5%) rules pass one so DCGM's 1-4%
+    idle noise tail over a zero median does not read as an unbounded
+    burst, while the API rule passes none - a zero baseline there
+    demands only a positive peak.  No cap is needed either: above each
+    criterion's normal threshold (peak threshold for CPU/GPU, request
+    threshold for the API server) those absolute branches fire first, so
+    the curve never governs there.
     """
     if baseline <= 0:
-        return 0.0
+        return floor
     multiple = ratio_threshold * (VARIANCE_BASELINE_FULL / baseline) ** VARIANCE_CURVE_EXPONENT
-    return multiple * baseline
+    return max(floor, multiple * baseline)
 
 
 def evaluate_variance(
@@ -777,16 +787,17 @@ def evaluate_variance(
     *,
     peak_threshold: float | None = None,
     ratio_threshold: float,
+    floor: float = 0.0,
     node: str = "",
 ) -> VarianceStats:
     """The variance rule: ACTIVE when any window exceeded `peak_threshold`
     (when given), or when the peak clears the baseline-scaled required peak
-    (see variance_required_peak)."""
+    (see variance_required_peak; `floor` is that requirement's minimum)."""
     if not points:
         return VarianceStats(0, 0.0, 0.0, None, None, None, False, False)
     peak = max(points)
     baseline = statistics.median(points)
-    required_peak = variance_required_peak(baseline, ratio_threshold)
+    required_peak = variance_required_peak(baseline, ratio_threshold, floor)
     ratio = peak / baseline if baseline > 0 else None
     required_ratio = required_peak / baseline if baseline > 0 else None
     peak_exceeded = peak_threshold is not None and peak > peak_threshold
@@ -809,6 +820,7 @@ def evaluate_variance_by_node(
     *,
     peak_threshold: float,
     ratio_threshold: float,
+    floor: float = 0.0,
     live_nodes: set[str] | None = None,
 ) -> list[VarianceStats]:
     """Evaluate the variance rule once per node, each against its own median.
@@ -837,6 +849,7 @@ def evaluate_variance_by_node(
             points,
             peak_threshold=peak_threshold,
             ratio_threshold=ratio_threshold,
+            floor=floor,
             node=node,
         )
         for node, points in sorted(grouped.items())
@@ -847,11 +860,10 @@ def evaluate_variance_by_node(
 def _variance_severity(stats: VarianceStats) -> tuple[float, float]:
     """Ranking key for which node drives a summarized evaluation: how far
     the peak clears that node's required peak (above 1 means the rule
-    fired), then the raw peak.  A zero baseline with a positive peak is an
-    unbounded multiple and outranks everything."""
+    fired), then the raw peak."""
     required = stats.required_peak or 0.0
     if required <= 0:
-        return (math.inf if stats.peak > 0 else 0.0, stats.peak)
+        return (0.0, stats.peak)
     return (stats.peak / required, stats.peak)
 
 
@@ -939,6 +951,7 @@ def check_cpu(
             series,
             peak_threshold=cfg.cpu_peak_threshold,
             ratio_threshold=cfg.cpu_variance_ratio,
+            floor=CPU_VARIANCE_FLOOR,
             live_nodes=live_nodes,
         )
         if per_node:
@@ -1078,6 +1091,7 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode]) -> 
         series,
         peak_threshold=cfg.gpu_peak_threshold,
         ratio_threshold=cfg.gpu_variance_ratio,
+        floor=GPU_VARIANCE_FLOOR,
     )
 
     stats: VarianceStats | None = None
@@ -1109,7 +1123,9 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode]) -> 
             peak = max(peaks)
             baseline = sum(avgs) / len(avgs) if avgs else 0.0
             ratio = peak / baseline if baseline > 0 else None
-            required_peak = variance_required_peak(baseline, cfg.gpu_variance_ratio)
+            required_peak = variance_required_peak(
+                baseline, cfg.gpu_variance_ratio, GPU_VARIANCE_FLOOR
+            )
             stats = VarianceStats(
                 points=len(peaks) + len(avgs),
                 peak=peak,

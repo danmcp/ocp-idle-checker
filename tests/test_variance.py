@@ -23,9 +23,10 @@ from helpers import base_config, make_range_series
         ([2.0, 2.0, 15.0], False, "peak 15 just below the required 15.0 at a median of 2"),
         ([20.0] * 10, False, "steady moderate load: requirement of 58.3"),
         ([25.0] * 10, False, "steady load below the peak threshold"),
-        # A zero baseline has no floor: any positive peak fires.
-        ([0.0, 0.0, 10.0], True, "zero median: any positive peak fires"),
-        ([0.0, 0.0, 0.5], True, "zero median: however small the peak, it fires"),
+        # With no floor passed (the API rule's configuration), a zero
+        # baseline fires on any positive peak; the CPU/GPU rules pass one.
+        ([0.0, 0.0, 10.0], True, "zero median, no floor: any positive peak fires"),
+        ([0.0, 0.0, 0.5], True, "zero median, no floor: however small the peak"),
         ([0.0] * 5, False, "all-zero data"),
         ([], False, "no data"),
         # Boundaries: strictly greater-than on both branches.
@@ -46,8 +47,9 @@ def test_evaluate_variance(points, expected_active, why):
 
 def test_required_peak_scales_with_baseline():
     """The required peak follows one power law: 10x the baseline at a
-    baseline of 1, falling to 2x at a baseline of 50, with no floor - a
-    zero baseline demands only a positive peak."""
+    baseline of 1, falling to 2x at a baseline of 50.  The floor defaults
+    to zero (the API rule); the CPU/GPU rules pass an absolute floor that
+    stands in for the whole curve on a zero baseline."""
     points = [10.0] * 6  # ratio 1: never fires, but the requirement is computed
 
     def required(baseline):
@@ -61,7 +63,12 @@ def test_required_peak_scales_with_baseline():
     assert required(50.0) == pytest.approx(100.0)  # 2x at a baseline of 50
     assert required(25.0) == pytest.approx(66.50, abs=0.01)  # ~2.66x in between
     assert required(5.0) == pytest.approx(25.79, abs=0.01)  # ~5.2x on quiet baselines
-    assert required(0.0) == pytest.approx(0.0)  # zero baseline: no floor
+    assert required(0.0) == pytest.approx(0.0)  # zero baseline, floorless
+    # The floor is the minimum requirement and the whole curve on a zero
+    # baseline; the curve stands above it once the baseline is big enough.
+    assert oic.variance_required_peak(0.0, 2.0, floor=5.0) == pytest.approx(5.0)
+    assert oic.variance_required_peak(0.1, 2.0, floor=5.0) == pytest.approx(5.0)  # curve: 2.6
+    assert oic.variance_required_peak(1.0, 2.0, floor=5.0) == pytest.approx(10.0)  # curve: 10
 
 
 def test_evaluate_variance_scaled_requirement_is_strict():
@@ -91,31 +98,44 @@ def test_evaluate_variance_reports_stats():
     assert stats.peak_exceeded
 
 
-def test_evaluate_variance_zero_baseline_has_no_floor():
-    # A zero baseline demands only a positive peak: 22% of DCGM-style noise
-    # over a zero median fires, all-zero data does not.
+def test_evaluate_variance_zero_baseline_demands_the_floor():
+    # A zero baseline makes the floor the whole requirement (the GPU rule's
+    # configuration): 22% of DCGM-style noise over a zero median clears the
+    # 5% floor and fires, the mmacik-sno 3.3% noise tail does not, and
+    # all-zero data never does.
     stats = oic.evaluate_variance(
         [0.0, 0.0, 22.0],
         peak_threshold=40.0,
         ratio_threshold=2.0,
+        floor=5.0,
     )
     assert stats.ratio is None
     assert stats.required_ratio is None
-    assert stats.required_peak == pytest.approx(0.0)
+    assert stats.required_peak == pytest.approx(5.0)
     assert stats.variance_exceeded
+    noise = oic.evaluate_variance(
+        [0.0, 0.0, 3.3],
+        peak_threshold=40.0,
+        ratio_threshold=2.0,
+        floor=5.0,
+    )
+    assert not noise.variance_exceeded
+    assert noise.required_peak == pytest.approx(5.0)
     zeros = oic.evaluate_variance(
         [0.0, 0.0, 0.0],
         peak_threshold=40.0,
         ratio_threshold=2.0,
+        floor=5.0,
     )
     assert not zeros.variance_exceeded
 
 
 def test_api_variance_zero_baseline_has_no_floor():
-    # A zero median demands only a positive request rate: 40 req/s over a
-    # zero median fires.
+    # The API rule passes no floor: a zero median demands only a positive
+    # request rate, so 40 req/s over a zero median fires.
     stats = oic.evaluate_variance([0.0, 0.0, 40.0], ratio_threshold=2.0)
     assert stats.peak_exceeded is False  # the API rule has no peak branch
+    assert stats.required_peak == pytest.approx(0.0)
     assert stats.variance_exceeded
 
 
@@ -192,22 +212,23 @@ def test_evaluate_variance_by_node_filters_dead_nodes():
     assert [s.node for s in per_node] == ["live-node"]
 
 
-def test_evaluate_variance_by_node_zero_baseline_fires_on_noise():
-    # The DCGM noise tail under the no-floor law: a zero-median exporter
-    # peaking at 3% now fires - the mmacik-sno GPU flip - alongside a
-    # genuinely busy sibling.  A positive peak over a zero baseline is an
-    # unbounded multiple, so the noise node drives the summary.
+def test_evaluate_variance_by_node_floor_suppresses_zero_baseline_noise():
+    # The GPU rule's floor: a zero-median exporter peaking at 3% (DCGM's
+    # idle noise tail, the mmacik-sno pattern) stays idle next to a
+    # genuinely bursty sibling, which fires and drives the summary.
     series = [
         make_range_series("noise", ["0"] * 10 + ["3"]),
         make_range_series("bursty", ["5"] * 10 + ["45"]),
     ]
-    per_node = oic.evaluate_variance_by_node(series, peak_threshold=40.0, ratio_threshold=2.0)
+    per_node = oic.evaluate_variance_by_node(
+        series, peak_threshold=40.0, ratio_threshold=2.0, floor=5.0
+    )
     by_node = {s.node: s for s in per_node}
-    assert by_node["noise"].variance_exceeded  # 3% over a zero median: no floor
+    assert not by_node["noise"].variance_exceeded  # 3% over a zero median: under the floor
     assert by_node["bursty"].variance_exceeded
     summary = oic.summarize_variance(per_node)
     assert summary.variance_exceeded
-    assert summary.node == "noise"  # an unbounded multiple outranks a finite one
+    assert summary.node == "bursty"
     assert summary.peak == pytest.approx(45.0)  # pooled max
 
 
@@ -230,6 +251,7 @@ def test_defaults_catch_the_false_idle_cores():
         [5.0] * 20 + [96.9],
         peak_threshold=cfg.cpu_peak_threshold,
         ratio_threshold=cfg.cpu_variance_ratio,
+        floor=oic.CPU_VARIANCE_FLOOR,
     )
     assert hot.active
     # mmacik-sno pattern: steady ~20% single-node load - stays idle.
@@ -237,6 +259,7 @@ def test_defaults_catch_the_false_idle_cores():
         [19.5, 19.5, 19.5, 19.5],
         peak_threshold=cfg.cpu_peak_threshold,
         ratio_threshold=cfg.cpu_variance_ratio,
+        floor=oic.CPU_VARIANCE_FLOOR,
     )
     assert not steady.active
     # The motivating burst: 1% idle, 11% under load - clears the required
@@ -245,5 +268,6 @@ def test_defaults_catch_the_false_idle_cores():
         [1.0] * 20 + [11.0],
         peak_threshold=cfg.cpu_peak_threshold,
         ratio_threshold=cfg.cpu_variance_ratio,
+        floor=oic.CPU_VARIANCE_FLOOR,
     )
     assert low_idle.active

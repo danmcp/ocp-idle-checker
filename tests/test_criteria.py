@@ -435,20 +435,20 @@ def test_gpu_active_on_variance_ratio():
     outcome = oic.check_gpu(base_config(), prom, [gpu_node()])
     assert outcome.result == "ACTIVE"
     assert outcome.entry["peak_exceeded"] is False
-    assert outcome.entry["variance_exceeded"] is True  # zero baseline: any positive peak fires
+    assert outcome.entry["variance_exceeded"] is True  # zero baseline: the floor is the requirement
     assert outcome.entry["ratio"] is None
-    assert outcome.entry["required_peak"] == pytest.approx(0.0)
+    assert outcome.entry["required_peak"] == pytest.approx(oic.GPU_VARIANCE_FLOOR)
 
 
-def test_gpu_zero_baseline_noise_is_active():
-    # The mmacik-sno swing vote under the no-floor law: dense-but-zero DCGM
-    # data peaking at 3.3% all week.  A zero baseline demands only a
-    # positive peak, so the DCGM noise tail now fires.
+def test_gpu_zero_baseline_below_the_floor_is_idle():
+    # The mmacik-sno swing vote: dense-but-zero DCGM data peaking at 3.3%
+    # all week.  The zero baseline demands the 5% floor, so the DCGM idle
+    # noise tail stays idle.
     prom = FakeProm(ranges={oic.GPU_RANGE_QUERY: [make_dcgm_series(["0", "0", "3.3"])]})
     outcome = oic.check_gpu(base_config(), prom, [gpu_node()])
-    assert outcome.result == "ACTIVE"
-    assert outcome.entry["variance_exceeded"] is True
-    assert outcome.entry["required_peak"] == pytest.approx(0.0)
+    assert outcome.result == "IDLE"
+    assert outcome.entry["variance_exceeded"] is False
+    assert outcome.entry["required_peak"] == pytest.approx(oic.GPU_VARIANCE_FLOOR)
 
 
 def test_gpu_quiet_is_idle():
