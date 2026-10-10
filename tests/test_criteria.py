@@ -58,16 +58,16 @@ def test_cpu_active_on_peak():
 
 def test_cpu_active_on_variance_ratio():
     # Median 5%, peak 28%: no window crossed the peak threshold, but the
-    # peak clears the required 14.4% (a 2.9x multiple) the cube-root curve
-    # demands at a median of 5.
+    # peak clears the required 25.8% (a 5.2x multiple) the curve demands
+    # at a median of 5.
     prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["5", "5", "28"])]})
     outcome = oic.check_cpu(base_config(), prom, {"node-1"}, None)
     assert outcome.result == "ACTIVE"
     assert outcome.entry["peak_exceeded"] is False
     assert outcome.entry["variance_exceeded"] is True
     assert outcome.entry["ratio"] == 5.6
-    assert outcome.entry["required_ratio"] == pytest.approx(2.88, abs=0.01)
-    assert outcome.entry["required_peak"] == pytest.approx(14.42, abs=0.01)
+    assert outcome.entry["required_ratio"] == pytest.approx(5.16, abs=0.01)
+    assert outcome.entry["required_peak"] == pytest.approx(25.79, abs=0.01)
 
 
 def test_cpu_quiet_cluster_is_idle():
@@ -88,14 +88,14 @@ def test_cpu_quiet_cluster_is_idle():
 
 
 def test_cpu_small_burst_on_quiet_median_is_active():
-    # Median 2%, peak 10%: the motivating pattern - a workload that idles at
-    # 2% and loads to 10% is active.  The required peak at a 2% median is
-    # 7.8%, so the 10% peak clears it; below it (7%) stays idle.
+    # Median 2%, peak 16%: the motivating pattern - a bursty workload on a
+    # quiet node is active.  The required peak at a 2% median is 15.0%
+    # (a 7.5x multiple), so a 5x burst to 10% stays idle while 16% fires.
     prom = FakeProm(
         ranges={
             oic.CPU_RANGE_QUERY: [
-                make_range_series("node-1", ["2", "2", "10"]),
-                make_range_series("node-2", ["2", "2", "7"]),
+                make_range_series("node-1", ["2", "2", "16"]),
+                make_range_series("node-2", ["2", "2", "10"]),
             ]
         }
     )
@@ -103,14 +103,14 @@ def test_cpu_small_burst_on_quiet_median_is_active():
     assert outcome.result == "ACTIVE"
     assert outcome.entry["peak_exceeded"] is False
     assert outcome.entry["variance_exceeded"] is True
-    assert outcome.entry["required_peak"] == pytest.approx(7.83, abs=0.01)
+    assert outcome.entry["required_peak"] == pytest.approx(15.04, abs=0.01)
     per_node = {e["node"]: e for e in outcome.entry["per_node"]}
     assert per_node["node-1"]["variance_exceeded"] is True
     assert per_node["node-2"]["variance_exceeded"] is False
 
 
 def test_cpu_large_burst_on_quiet_median_is_active():
-    # Median 2%, peak 20%: 10x clears the 7.75x requirement.
+    # Median 2%, peak 20%: 10x clears the 7.5x requirement.
     prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["2", "2", "20"])]})
     outcome = oic.check_cpu(base_config(), prom, {"node-1"}, 2.0)
     assert outcome.result == "ACTIVE"
@@ -137,7 +137,7 @@ def test_cpu_steady_busy_and_quiet_nodes_are_idle():
     assert outcome.entry["peak"] == 19.5  # pooled max across nodes
     assert outcome.entry["value"] == "19.50"
     # The summary reports the node closest to its own requirement - the
-    # busy one (19.5 of a pinned 2x34) vs the quiet one (2.4 of 7.8) -
+    # busy one (19.5 of a required 53.0) vs the quiet one (2.4 of 15.0) -
     # plus the full per-node detail.
     assert outcome.entry["node"] == "busy-node"
     assert outcome.entry["ratio"] == pytest.approx(1.15)  # 19.5/17, rounded as exported
@@ -315,7 +315,8 @@ def test_api_quiet_is_idle():
 
 def test_api_variance_detector_marks_active():
     # Average 5 req/s is far below 100, but a 15-minute window hit 100 req/s:
-    # 10x the median and above the variance floor.
+    # 10x the median, clearing the required 38.8 (a 3.9x multiple) the
+    # curve demands at a median of 10.
     prom = FakeProm(
         instant={api_avg_query(WINDOW): 5.0},
         ranges={
@@ -329,16 +330,13 @@ def test_api_variance_detector_marks_active():
     assert outcome.entry["variance_active"] is True
     assert outcome.entry["variance_peak"] == 100.0
     assert outcome.entry["variance_ratio"] == 10.0
-    # At a median of 10 the curve demands 34.2 req/s, but the 50 floor
-    # stands above it, so the requirement is the floor: a 5x multiple.
-    assert outcome.entry["variance_required_ratio"] == pytest.approx(5.0, abs=0.01)
-    assert outcome.entry["variance_required_peak"] == pytest.approx(50.0)
+    assert outcome.entry["variance_required_ratio"] == pytest.approx(3.88, abs=0.01)
+    assert outcome.entry["variance_required_peak"] == pytest.approx(38.78, abs=0.01)
 
 
 def test_api_variance_on_quiet_median_needs_a_bigger_burst():
-    # Median 25 req/s: the shared curve demands 2x25x(50/25)^(1/3) = 63
-    # req/s (~2.5x), so a burst to 55 - above the floor of 50 - is not
-    # variance, while a burst to 70 is.
+    # Median 25 req/s: the curve demands 66.5 req/s (~2.7x), so a burst to
+    # 55 is not variance, while a burst to 70 is.
     quiet = FakeProm(
         instant={api_avg_query(WINDOW): 25.0},
         ranges={
@@ -350,7 +348,7 @@ def test_api_variance_on_quiet_median_needs_a_bigger_burst():
     outcome = oic.check_api(base_config(), quiet)
     assert outcome.result == "IDLE"
     assert outcome.entry["variance_active"] is False
-    assert outcome.entry["variance_required_ratio"] == pytest.approx(2.52, abs=0.01)
+    assert outcome.entry["variance_required_ratio"] == pytest.approx(2.66, abs=0.01)
     loud = FakeProm(
         instant={api_avg_query(WINDOW): 25.0},
         ranges={
@@ -364,9 +362,9 @@ def test_api_variance_on_quiet_median_needs_a_bigger_burst():
     assert outcome.entry["variance_active"] is True
 
 
-def test_api_steady_load_above_floor_stays_idle():
-    # Peak 80 is above the floor of 50 but only 1x the median; a median
-    # above half the scale pins the requirement at 2x = 160 req/s.
+def test_api_steady_load_stays_idle():
+    # Peak 80 is only 1x the median: the curve demands 131.9 req/s at a
+    # median of 80, and the 80 req/s average is below the 100 threshold.
     prom = FakeProm(
         instant={api_avg_query(WINDOW): 80.0},
         ranges={
@@ -437,20 +435,20 @@ def test_gpu_active_on_variance_ratio():
     outcome = oic.check_gpu(base_config(), prom, [gpu_node()])
     assert outcome.result == "ACTIVE"
     assert outcome.entry["peak_exceeded"] is False
-    assert outcome.entry["variance_exceeded"] is True  # zero baseline: the floor is the requirement
+    assert outcome.entry["variance_exceeded"] is True  # zero baseline: any positive peak fires
     assert outcome.entry["ratio"] is None
-    assert outcome.entry["required_peak"] == pytest.approx(oic.GPU_VARIANCE_FLOOR)
+    assert outcome.entry["required_peak"] == pytest.approx(0.0)
 
 
-def test_gpu_zero_baseline_below_the_floor_is_idle():
-    # The mmacik-sno swing vote: dense-but-zero DCGM data peaking at 3.3%
-    # all week.  The zero baseline demands the 5% floor instead of the
-    # unbounded ratio the rule once applied, so the noise tail stays idle.
+def test_gpu_zero_baseline_noise_is_active():
+    # The mmacik-sno swing vote under the no-floor law: dense-but-zero DCGM
+    # data peaking at 3.3% all week.  A zero baseline demands only a
+    # positive peak, so the DCGM noise tail now fires.
     prom = FakeProm(ranges={oic.GPU_RANGE_QUERY: [make_dcgm_series(["0", "0", "3.3"])]})
     outcome = oic.check_gpu(base_config(), prom, [gpu_node()])
-    assert outcome.result == "IDLE"
-    assert outcome.entry["variance_exceeded"] is False
-    assert outcome.entry["required_peak"] == pytest.approx(oic.GPU_VARIANCE_FLOOR)
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["variance_exceeded"] is True
+    assert outcome.entry["required_peak"] == pytest.approx(0.0)
 
 
 def test_gpu_quiet_is_idle():
@@ -511,8 +509,8 @@ def test_gpu_deleted_node_samples_still_vote():
 
 def test_gpu_aggregate_fallback():
     # No query_range matrix: whole-window max/avg aggregates decide.  Peak
-    # 30 over a 4% average clears the required 13.7% the cube-root curve
-    # demands at that baseline.
+    # 30 over a 4% average clears the required 22.6% the curve demands
+    # at that baseline.
     prom = FakeProm(
         instant_all={
             gpu_max_query(WINDOW): [
@@ -531,8 +529,8 @@ def test_gpu_aggregate_fallback():
     assert outcome.entry["peak"] == 30.0
     assert outcome.entry["baseline"] == 4.0  # mean of the per-series averages
     assert outcome.entry["ratio"] == 7.5  # 30/4, rounded as exported
-    assert outcome.entry["required_ratio"] == pytest.approx(3.42, abs=0.01)
-    assert outcome.entry["required_peak"] == pytest.approx(13.68, abs=0.01)
+    assert outcome.entry["required_ratio"] == pytest.approx(5.65, abs=0.01)
+    assert outcome.entry["required_peak"] == pytest.approx(22.61, abs=0.01)
 
 
 def test_gpu_aggregate_fallback_quiet():

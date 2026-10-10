@@ -32,7 +32,6 @@ def test_variance_rule_defaults():
     assert cfg.gpu_peak_threshold == 40.0
     assert cfg.gpu_variance_ratio == 2.0
     assert cfg.api_variance_ratio == 2.0
-    assert cfg.api_variance_floor == 50.0
 
 
 def test_window_flag():
@@ -61,8 +60,6 @@ def test_variance_rule_flags():
             "2.5",
             "--api-variance-ratio",
             "4",
-            "--api-variance-floor",
-            "75",
         ]
     )
     assert cfg.cpu_peak_threshold == 55.0
@@ -70,13 +67,12 @@ def test_variance_rule_flags():
     assert cfg.gpu_peak_threshold == 60.0
     assert cfg.gpu_variance_ratio == 2.5
     assert cfg.api_variance_ratio == 4.0
-    assert cfg.api_variance_floor == 75.0
 
 
 def test_removed_and_renamed_variance_flags_are_rejected():
-    # The CPU/GPU variance floors were removed outright, and the ratio/floor
-    # flags were renamed to *-variance-*; old spellings must fail loudly
-    # rather than be silently ignored.
+    # The variance floors were removed outright, and the ratio/floor flags
+    # were renamed to *-variance-*; old spellings must fail loudly rather
+    # than be silently ignored.
     with pytest.raises(SystemExit):
         oic.parse_args(["--cpu-shape-floor", "20"])
     with pytest.raises(SystemExit):
@@ -89,6 +85,8 @@ def test_removed_and_renamed_variance_flags_are_rejected():
         oic.parse_args(["--api-spike-ratio", "4"])
     with pytest.raises(SystemExit):
         oic.parse_args(["--api-spike-floor", "75"])
+    with pytest.raises(SystemExit):
+        oic.parse_args(["--api-variance-floor", "75"])
 
 
 def test_legacy_flags_still_parse():

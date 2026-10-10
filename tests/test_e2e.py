@@ -213,7 +213,6 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
         "gpu_peak_threshold",
         "gpu_variance_ratio",
         "api_variance_ratio",
-        "api_variance_floor",
     ]
     criteria = report["criteria"]
     assert list(criteria) == [

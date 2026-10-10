@@ -31,9 +31,9 @@ Each criterion is evaluated independently and can be `IDLE`, `ACTIVE`, `UNKNOWN`
 
 | Criterion | Votes ACTIVE when |
 |-----------|-------------------|
-| **CPU** | any node's 15-minute window > 30%, or any node's window peak clearing a baseline-scaled required peak (≈5× its own median at a 1% median, 2× at 15%); an instant `oc adm top nodes` reading ≥ 15% can also flip an otherwise-IDLE result |
+| **CPU** | any node's 15-minute window > 30%, or any node's window peak clearing a baseline-scaled required peak (10× its own median at a 1% median, 2× at 50%); an instant `oc adm top nodes` reading ≥ 15% can also flip an otherwise-IDLE result |
 | **Memory** | the time-windowed average ≥ 35%, or an instant snapshot ≥ 35% (one-directional override) |
-| **API Server** | the time-windowed average ≥ 100 req/sec, or any 15-minute window clearing a baseline-scaled required peak (2× the median at a 50 req/s median, ≈2.5× at 25, floor of 50 req/s on quieter medians) |
+| **API Server** | the time-windowed average ≥ 100 req/sec, or any 15-minute window clearing a baseline-scaled required peak (10× the median at a 1 req/s median, 2× at 50 req/s) |
 | **GPU** | any node's 15-minute window > 40%, or any node's window peak clearing a baseline-scaled required peak (DCGM GPU utilization) |
 | **Operators** | the median controller age is < 7 days, or ≥ 5 reconciliation events in the last 48 hours |
 
@@ -46,19 +46,19 @@ The CPU and GPU criteria take per-node 15-minute window averages from the Promet
 - **Peak rule**: any node's 15-minute window averaged above the peak threshold (30% for CPU, 40% for GPU), **or**
 - **Variance rule**: a node's window peak clears a **required peak** derived from that node's own median window.
 
-The required peak is anchored at the peak threshold: at half of it (a 15% CPU median) the requirement is exactly the threshold — 2× the median, where the two branches of the rule meet — and it falls with the cube root of the median below that, so a workload that idles at 1% and loads to 10% is caught while a steady node sitting near its own median never fires:
+The required peak follows one power law shared by all three variance rules, in each criterion's native unit (percent for CPU/GPU, req/s for the API server): **10× the baseline at a baseline of 1**, falling to **2× at a baseline of 50**, so quiet baselines need proportionally bigger bursts before they count as bursty while a steady node sitting near its own median never fires:
 
-| node median | required multiple (CPU / GPU) | required peak (CPU, threshold 30) | required peak (GPU, threshold 40) |
-|---|---|---|---|
-| 0% | — (floor) | 1% | 5% |
-| 1% | 4.9× / 5.4× | 4.9% | 5.4% |
-| 2% | 3.9× / 4.3× | 7.8% | 8.6% |
-| 5% | 2.9× / 3.2× | 14.4% | 15.9% |
-| 10% | 2.3× / 2.5× | 22.9% | 25.2% |
-| half the threshold (15% / 20%) | 2× | 30% | 40% |
-| above half | 2× (pinned) | 2× the median — the peak rule fires first | ditto |
+| node median | required multiple | required peak |
+|---|---|---|
+| 0% | any positive peak fires | — |
+| 1% | 10× | 10% |
+| 2% | 7.5× | 15.0% |
+| 5% | 5.2× | 25.8% |
+| 10% | 3.9× | 38.8% |
+| 20% | 2.9× | 58.3% |
+| 50% | 2× | 100% |
 
-The multiple is `variance-ratio` (default 2×) at half the threshold and above it; below, the variance rule is the sensitive branch, since above half it cannot fire before the peak rule does. A zero or near-zero baseline requires an absolute floor instead of a ratio — 1% for CPU, 5% for GPU — replacing the unbounded ratio the rule once applied there, which fired on DCGM's 1-4% idle noise tail (kernel-residency blips from context init, ECC scrubbing, and health probes, not real use). Fleet calibration put the CPU peak threshold at 30%: the 30-40% max-peak band is sustained workloads the variance rule cannot see (a steady node sits near its own median), idle exemplars peak below 20%, and the highest one-off blip below 40% sits at 26.9%.
+The multiple is `variance-ratio` (default 2×) at a baseline of 50 and above; below, the variance rule is the sensitive branch. Above each criterion's normal threshold nothing needs the variance rule at all — a window over the peak threshold fires the peak rule (CPU/GPU), and an API median large enough to shallow the curve implies a windowed average over the request threshold — so the curve carries no cap. There is no floor either: a zero baseline demands only a positive peak. That is a deliberate trade: DCGM's 1-4% idle noise tail (kernel-residency blips from context init, ECC scrubbing, and health probes, not real use) now fires the GPU rule on zero-median exporters. Fleet calibration put the CPU peak threshold at 30%: the 30-40% max-peak band is sustained workloads the variance rule cannot see (a steady node sits near its own median), idle exemplars peak below 20%, and the highest one-off blip below 40% sits at 26.9%.
 
 The criteria JSON detail exports each node's peak, median, ratio, required multiple, and required peak (`per_node`), with the cluster-level summary reporting the pooled peak plus the baseline/ratio of the node that came closest to (or furthest past) its own requirement (`node`, `required_ratio`, `required_peak`).
 
@@ -66,7 +66,7 @@ CPU falls back to the legacy window-average rule when the range matrix is unavai
 
 ### Variance Detection (API Server)
 
-The API server criterion keeps the legacy window-average threshold (100 req/sec) and adds a second detector: any 15-minute window clearing a baseline-scaled required peak also counts as ACTIVE. The detector shares the CPU/GPU law, with the request-rate threshold (100 req/s) as the scale: the requirement is 2× the median at a 50 req/s median — where the required peak equals the request threshold itself — ≈2.5× at 25 req/s, and steeper on quieter medians down to the absolute floor of 50 req/s, which is the whole requirement on medians below ~18 req/s. Unlike CPU/GPU there is no peak branch; the absolute-threshold branch is the windowed average checked alongside it.
+The API server criterion keeps the legacy window-average threshold (100 req/sec) and adds a second detector: any 15-minute window clearing a baseline-scaled required peak also counts as ACTIVE. The detector shares the CPU/GPU law in req/s: 10× the median at a 1 req/s median, 2× at 50 req/s, power law in between, no floor. Unlike CPU/GPU there is no peak branch; the absolute-threshold branch is the windowed average checked alongside it, and it owns the high end — a median above ~200 req/s implies a windowed average above the request threshold.
 
 ### Operators
 
@@ -111,11 +111,10 @@ CPU and memory `UNKNOWN` still count toward the denominator (they never help the
 | `--operator-exclude-prefixes PREFIX,...` | Namespace prefixes excluded from the operator scan | openshift-,kube-,open-cluster-management- |
 | `--operator-event-hours HOURS` | Reconciliation event window for the operators criterion | 48 |
 | `--cpu-peak-threshold N` | CPU: any 15-min window above this % = ACTIVE | 30 |
-| `--cpu-variance-ratio N` | CPU: burst multiple the peak must clear when a node median is at half the peak threshold; quieter medians require more | 2 |
+| `--cpu-variance-ratio N` | CPU: burst multiple the peak must clear at a baseline of 50 percent; quieter baselines require more | 2 |
 | `--gpu-peak-threshold N` | GPU: any 15-min window above this % = ACTIVE | 40 |
-| `--gpu-variance-ratio N` | GPU: burst multiple the peak must clear when a node median is at half the peak threshold; quieter medians require more | 2 |
-| `--api-variance-ratio N` | API: burst multiple the peak must clear when the median window is at half the request threshold; quieter medians require more | 2 |
-| `--api-variance-floor N` | API: minimum peak in req/s the rule demands on a quiet median | 50 |
+| `--gpu-variance-ratio N` | GPU: burst multiple the peak must clear at a baseline of 50 percent; quieter baselines require more | 2 |
+| `--api-variance-ratio N` | API: burst multiple the peak must clear at a baseline of 50 req/s; quieter baselines require more | 2 |
 | `--csv FILE` | Export to CSV | - |
 | `--json FILE` | Export to JSON | - |
 | `--token TOKEN` | Prometheus bearer token (resolved via `oc` when omitted) | - |
@@ -164,11 +163,11 @@ timestamp,cluster,status,cpu_result,cpu_value,memory_result,...,gpu_result,gpu_v
       "peak": 9.0,
       "baseline": 3.0,
       "ratio": 3.0,
-      "required_ratio": 3.42,
-      "required_peak": 10.26,
+      "required_ratio": 6.36,
+      "required_peak": 19.09,
       "node": "node-1",
       "per_node": [
-        {"node": "node-1", "peak": 9.0, "baseline": 3.0, "ratio": 3.0, "required_ratio": 3.42, "required_peak": 10.26, "points": 673, "peak_exceeded": false, "variance_exceeded": false}
+        {"node": "node-1", "peak": 9.0, "baseline": 3.0, "ratio": 3.0, "required_ratio": 6.36, "required_peak": 19.09, "points": 673, "peak_exceeded": false, "variance_exceeded": false}
       ]
     },
     "gpu": { "result": "ACTIVE", "peak": 80.0 },

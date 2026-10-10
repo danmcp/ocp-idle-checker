@@ -81,7 +81,6 @@ def base_config(**overrides) -> oic.Config:
         gpu_peak_threshold=40.0,
         gpu_variance_ratio=2.0,
         api_variance_ratio=2.0,
-        api_variance_floor=50.0,
         verbose=False,
         debug_probe=False,
         token="",

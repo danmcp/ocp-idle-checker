@@ -14,7 +14,7 @@ A cluster is IDLE when at least 80% of the applicable criteria vote IDLE:
              node pooled with a quiet sibling is two steady nodes, not a
              burst: ACTIVE when any node's window averaged above the peak
              threshold, or when a node's window peak clears a
-             baseline-scaled required peak anchored at the peak threshold.
+             baseline-scaled required peak.
              Falls back to the legacy window-average rule when the
              matrix is unavailable.  An instant reading above the idle
              threshold can still override an IDLE result (one-directional,
@@ -23,9 +23,7 @@ A cluster is IDLE when at least 80% of the applicable criteria vote IDLE:
              instant override.
   api_server legacy window-average request rate against the threshold, plus
              a variance detector: any 15-minute window clearing a
-             baseline-scaled required peak (anchored at the request
-             threshold, floored at an absolute request rate) also counts
-             as ACTIVE.
+             baseline-scaled required peak also counts as ACTIVE.
   gpu        the same per-node variance rule as cpu, on DCGM GPU
              utilization (DCGM_FI_DEV_GPU_UTIL).  N/A (not counted) on
              clusters without GPU nodes or without DCGM metrics.
@@ -37,16 +35,18 @@ A cluster is IDLE when at least 80% of the applicable criteria vote IDLE:
              threshold.  N/A (not counted) when no controller pods exist
              anywhere on the cluster.
 
-The variance parameters (peak threshold, ratio; the API rule also has an
-absolute floor) are fleet calibration knobs exposed as command-line
-flags; the defaults are provisional.  All three variance rules share one
-law: the peak must clear ratio_threshold times the baseline when the
-baseline sits at half the criterion's normal threshold (peak threshold
-for CPU/GPU, request threshold for API) - where the required peak equals
-that threshold - and the multiple grows with the cube root of the
-shortfall below it, so quiet baselines need proportionally bigger bursts
-before they count as bursty.  A floor (percent for CPU/GPU, req/s for
-API) is the whole requirement on a zero baseline.  "Baseline" is the
+The variance parameters (peak threshold, ratio) are fleet calibration
+knobs exposed as command-line flags; the defaults are provisional.  All
+three variance rules share one law, in each criterion's native unit
+(percent for CPU/GPU, req/s for the API server): the peak must clear 10x
+the baseline at a baseline of 1, falling to ratio_threshold times the
+baseline at a baseline of 50, with the required multiple following a
+power law in between, so quiet baselines need proportionally bigger
+bursts before they count as bursty.  There is no floor - a zero baseline
+demands only a positive peak - and no cap is needed: above each
+criterion's normal threshold (peak threshold for CPU/GPU, request
+threshold for the API server) those absolute branches fire first, so the
+variance rule never governs there.  "Baseline" is the
 median of the 15-minute windows on the query_range path and the window
 mean on the aggregate fallback path.
 
@@ -110,13 +110,20 @@ ML_NODE_PATTERN = "p5|p4d|g5"
 
 # Variance rule defaults - fleet-calibration knobs, ideal values TBD.
 CPU_PEAK_THRESHOLD = 30.0  # percent; any 15-min window above this = ACTIVE
-CPU_VARIANCE_RATIO = 2.0  # burst multiple required at half the peak threshold
-CPU_VARIANCE_FLOOR = 1.0  # percent; minimum peak the burst rule demands on a zero baseline
+CPU_VARIANCE_RATIO = 2.0  # burst multiple required at a baseline of 50
 GPU_PEAK_THRESHOLD = 40.0
-GPU_VARIANCE_RATIO = 2.0  # burst multiple required at half the peak threshold
-GPU_VARIANCE_FLOOR = 5.0  # percent; DCGM's idle noise tail reads 1-4% on a GPU doing nothing
-API_VARIANCE_RATIO = 2.0  # burst multiple required at half the request threshold
-API_VARIANCE_FLOOR = 50.0  # requests/sec; minimum peak the rule demands on a quiet baseline
+GPU_VARIANCE_RATIO = 2.0  # burst multiple required at a baseline of 50
+API_VARIANCE_RATIO = 2.0  # burst multiple required at a baseline of 50 req/s
+
+# The shared variance law, in each criterion's native unit: the required
+# multiple is 5x the ratio at a baseline of 1 (10x with the default 2x) and
+# falls to the ratio at VARIANCE_BASELINE_FULL, following a power law in
+# between.  No floor - a zero baseline demands only a positive peak - and
+# no cap: above each criterion's normal threshold the absolute branches
+# (window peak over the peak threshold, API windowed average over the
+# request threshold) fire first.
+VARIANCE_BASELINE_FULL = 50.0  # baseline where the required multiple bottoms out at the ratio
+VARIANCE_CURVE_EXPONENT = math.log(5.0) / math.log(VARIANCE_BASELINE_FULL)
 
 VARIANCE_WINDOW_MINUTES = 15  # the "15 min period" of the variance rule
 STEP_SECONDS = 900  # query_range step: one point per 15-min window
@@ -235,7 +242,6 @@ class Config:
     gpu_peak_threshold: float
     gpu_variance_ratio: float
     api_variance_ratio: float
-    api_variance_floor: float
     verbose: bool
     debug_probe: bool
     token: str
@@ -335,7 +341,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         type=float,
         default=CPU_VARIANCE_RATIO,
         metavar="N",
-        help="CPU variance rule: burst multiple the peak must clear when a node median is at half the peak threshold; quieter medians require more (default: %(default)s)",
+        help="CPU variance rule: burst multiple the peak must clear at a baseline of 50 percent; quieter baselines require more (default: %(default)s)",
     )
     parser.add_argument(
         "--gpu-peak-threshold",
@@ -349,21 +355,14 @@ def parse_args(argv: list[str] | None = None) -> Config:
         type=float,
         default=GPU_VARIANCE_RATIO,
         metavar="N",
-        help="GPU variance rule: burst multiple the peak must clear when a node median is at half the peak threshold; quieter medians require more (default: %(default)s)",
+        help="GPU variance rule: burst multiple the peak must clear at a baseline of 50 percent; quieter baselines require more (default: %(default)s)",
     )
     parser.add_argument(
         "--api-variance-ratio",
         type=float,
         default=API_VARIANCE_RATIO,
         metavar="N",
-        help="API variance rule: burst multiple the peak must clear when the median window is at half the request threshold; quieter medians require more (default: %(default)s)",
-    )
-    parser.add_argument(
-        "--api-variance-floor",
-        type=float,
-        default=API_VARIANCE_FLOOR,
-        metavar="N",
-        help="API variance rule: minimum peak in req/s the rule demands on a quiet median (default: %(default)s)",
+        help="API variance rule: burst multiple the peak must clear at a baseline of 50 req/s; quieter baselines require more (default: %(default)s)",
     )
     parser.add_argument(
         "--debug-probe",
@@ -391,7 +390,6 @@ def parse_args(argv: list[str] | None = None) -> Config:
         gpu_peak_threshold=args.gpu_peak_threshold,
         gpu_variance_ratio=args.gpu_variance_ratio,
         api_variance_ratio=args.api_variance_ratio,
-        api_variance_floor=args.api_variance_floor,
         verbose=not args.quiet,
         debug_probe=args.debug_probe,
         token=args.token,
@@ -754,28 +752,24 @@ class VarianceStats:
         return self.peak_exceeded or self.variance_exceeded
 
 
-def variance_required_peak(
-    baseline: float, ratio_threshold: float, ratio_scale: float, floor: float
-) -> float:
+def variance_required_peak(baseline: float, ratio_threshold: float) -> float:
     """Absolute window peak the variance rule demands at a baseline.
 
-    `ratio_scale` is the criterion's normal threshold - the peak threshold
-    for CPU/GPU, the request threshold for the API server.  The multiple the
-    peak must clear is ratio_threshold when the baseline sits at half the
-    scale - where the required peak equals the scale, so for CPU/GPU the
-    two branches of the rule meet - and grows with the cube root of the
-    shortfall below that: roughly 5x at a 1% median against a 30% scale, so
-    a workload that idles at 1% and loads to 10% is caught.  Above half the
-    scale the multiple is pinned at ratio_threshold, where for CPU/GPU the
-    peak rule subsumes this one.  `floor` is the minimum required peak, and
-    stands in for the whole curve on a zero baseline: the unbounded ratio
-    the rule once applied there fired on DCGM's 1-4% idle noise tail.
+    One law shared by CPU, GPU, and the API server, in each criterion's
+    native unit (percent for CPU/GPU, req/s for the API server): the
+    required multiple is 5x ratio_threshold at a baseline of 1 (10x with
+    the default 2x) and falls to ratio_threshold at a baseline of 50,
+    following a power law in between, so quiet baselines need
+    proportionally bigger bursts before they count as bursty.  There is
+    no floor - a zero baseline demands only a positive peak.  No cap is
+    needed either: above each criterion's normal threshold (peak
+    threshold for CPU/GPU, request threshold for the API server) those
+    absolute branches fire first, so the curve never governs there.
     """
     if baseline <= 0:
-        return floor
-    half = ratio_scale / 2.0
-    multiple = ratio_threshold * max(1.0, (half / baseline) ** (1.0 / 3.0))
-    return max(floor, multiple * baseline)
+        return 0.0
+    multiple = ratio_threshold * (VARIANCE_BASELINE_FULL / baseline) ** VARIANCE_CURVE_EXPONENT
+    return multiple * baseline
 
 
 def evaluate_variance(
@@ -783,25 +777,16 @@ def evaluate_variance(
     *,
     peak_threshold: float | None = None,
     ratio_threshold: float,
-    floor: float,
-    ratio_scale: float | None = None,
     node: str = "",
 ) -> VarianceStats:
     """The variance rule: ACTIVE when any window exceeded `peak_threshold`
-    (when given), or when the peak clears the baseline-scaled required peak.
-
-    `ratio_scale` anchors the required peak (see variance_required_peak) and
-    defaults to `peak_threshold`; one of the two must be given.  `floor` is
-    the minimum required peak and the whole requirement on a zero baseline.
-    """
-    scale = peak_threshold if ratio_scale is None else ratio_scale
-    if scale is None:
-        raise ValueError("ratio_scale is required when peak_threshold is omitted")
+    (when given), or when the peak clears the baseline-scaled required peak
+    (see variance_required_peak)."""
     if not points:
         return VarianceStats(0, 0.0, 0.0, None, None, None, False, False)
     peak = max(points)
     baseline = statistics.median(points)
-    required_peak = variance_required_peak(baseline, ratio_threshold, scale, floor)
+    required_peak = variance_required_peak(baseline, ratio_threshold)
     ratio = peak / baseline if baseline > 0 else None
     required_ratio = required_peak / baseline if baseline > 0 else None
     peak_exceeded = peak_threshold is not None and peak > peak_threshold
@@ -824,8 +809,6 @@ def evaluate_variance_by_node(
     *,
     peak_threshold: float,
     ratio_threshold: float,
-    floor: float,
-    ratio_scale: float | None = None,
     live_nodes: set[str] | None = None,
 ) -> list[VarianceStats]:
     """Evaluate the variance rule once per node, each against its own median.
@@ -854,8 +837,6 @@ def evaluate_variance_by_node(
             points,
             peak_threshold=peak_threshold,
             ratio_threshold=ratio_threshold,
-            floor=floor,
-            ratio_scale=ratio_scale,
             node=node,
         )
         for node, points in sorted(grouped.items())
@@ -866,10 +847,11 @@ def evaluate_variance_by_node(
 def _variance_severity(stats: VarianceStats) -> tuple[float, float]:
     """Ranking key for which node drives a summarized evaluation: how far
     the peak clears that node's required peak (above 1 means the rule
-    fired), then the raw peak."""
+    fired), then the raw peak.  A zero baseline with a positive peak is an
+    unbounded multiple and outranks everything."""
     required = stats.required_peak or 0.0
     if required <= 0:
-        return (0.0, stats.peak)
+        return (math.inf if stats.peak > 0 else 0.0, stats.peak)
     return (stats.peak / required, stats.peak)
 
 
@@ -957,7 +939,6 @@ def check_cpu(
             series,
             peak_threshold=cfg.cpu_peak_threshold,
             ratio_threshold=cfg.cpu_variance_ratio,
-            floor=CPU_VARIANCE_FLOOR,
             live_nodes=live_nodes,
         )
         if per_node:
@@ -1050,8 +1031,6 @@ def check_api(cfg: Config, prom: PrometheusClient) -> CheckOutcome:
             stats = evaluate_variance(
                 variance_points,
                 ratio_threshold=cfg.api_variance_ratio,
-                floor=cfg.api_variance_floor,
-                ratio_scale=cfg.api_threshold,
             )
     else:
         avg = prom.query("sum(rate(apiserver_request_total[5m]))")
@@ -1099,7 +1078,6 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode]) -> 
         series,
         peak_threshold=cfg.gpu_peak_threshold,
         ratio_threshold=cfg.gpu_variance_ratio,
-        floor=GPU_VARIANCE_FLOOR,
     )
 
     stats: VarianceStats | None = None
@@ -1131,9 +1109,7 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode]) -> 
             peak = max(peaks)
             baseline = sum(avgs) / len(avgs) if avgs else 0.0
             ratio = peak / baseline if baseline > 0 else None
-            required_peak = variance_required_peak(
-                baseline, cfg.gpu_variance_ratio, cfg.gpu_peak_threshold, GPU_VARIANCE_FLOOR
-            )
+            required_peak = variance_required_peak(baseline, cfg.gpu_variance_ratio)
             stats = VarianceStats(
                 points=len(peaks) + len(avgs),
                 peak=peak,
@@ -1633,7 +1609,6 @@ def run(argv: list[str] | None = None) -> int:
             "gpu_peak_threshold": cfg.gpu_peak_threshold,
             "gpu_variance_ratio": cfg.gpu_variance_ratio,
             "api_variance_ratio": cfg.api_variance_ratio,
-            "api_variance_floor": cfg.api_variance_floor,
         },
         "criteria": {
             "total": total,

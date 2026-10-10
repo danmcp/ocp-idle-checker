@@ -164,7 +164,7 @@ def test_base_config_matches_shipped_defaults():
     cfg = base_config()
     assert cfg.time_window_minutes == oic.DEFAULT_TIME_WINDOW_MINUTES
     assert cfg.cpu_peak_threshold == oic.CPU_PEAK_THRESHOLD
-    assert cfg.api_variance_floor == oic.API_VARIANCE_FLOOR
+    assert cfg.api_variance_ratio == oic.API_VARIANCE_RATIO
     assert cfg.operator_namespaces == oic.OPERATOR_NAMESPACES
     assert cfg.operator_exclude_prefixes == oic.OPERATOR_EXCLUDE_PREFIXES
     assert cfg.operator_event_hours == oic.OPERATOR_EVENT_WINDOW_HOURS
