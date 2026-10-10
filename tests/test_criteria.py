@@ -7,6 +7,7 @@ oc CLI is stubbed with FakeOc for the operators criterion.
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 
 import ocp_idle_check as oic
@@ -715,3 +716,35 @@ def test_parse_k8s_timestamp():
     assert oic.parse_k8s_timestamp("not-a-timestamp") is None
     # Naive values are read as UTC, never left to poison the arithmetic.
     assert oic.parse_k8s_timestamp("2026-10-01T12:00:00") == datetime(2026, 10, 1, 12, tzinfo=UTC)
+
+
+def test_node_top_percentages_maps_and_skips_malformed():
+    lines = [
+        "node-1 250m 2% 3212Mi 5%",
+        "gpu-node-1 500m 3% 8000Mi 6%",
+        "short line",
+        "node-2 100m junk% 2000Mi 7%",
+    ]
+    # Malformed rows are dropped whole; later duplicates win, like a dict build.
+    assert oic.node_top_percentages(lines) == {
+        "node-1": (2.0, 5.0),
+        "gpu-node-1": (3.0, 6.0),
+    }
+
+
+def test_instant_by_instance_and_average_matching():
+    series = [
+        {"metric": {"instance": "gpu-node-1:9100"}, "value": [1700000000, "7"]},
+        {"metric": {"instance": "gpu-node-10:9100"}, "value": [1700000000, "9"]},
+        {"metric": {"instance": "other:9100"}, "value": [1700000000, "50"]},
+        {"metric": {}, "value": [1700000000, "junk"]},
+    ]
+    by_instance = oic.instant_by_instance(series)
+    assert by_instance == {"gpu-node-1:9100": 7.0, "gpu-node-10:9100": 9.0, "other:9100": 50.0}
+    # The prefix quirk is inherited from the original per-node queries:
+    # `instance=~"gpu-node-1.*"` also matches gpu-node-10's series, so the
+    # mean pools both. An unmatched node has no value.
+    gpu_node_1 = re.compile(r"gpu-node-1.*")
+    assert oic.average_matching(by_instance, gpu_node_1) == 8.0
+    assert oic.average_matching(by_instance, re.compile(r"missing.*")) is None
+    assert oic.instant_by_instance(None) == {}

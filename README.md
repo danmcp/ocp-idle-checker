@@ -129,6 +129,9 @@ Automatically detects GPU nodes (NVIDIA/AMD) and reports:
 - CPU and memory usage (current + windowed)
 - DCGM GPU utilization as a voting criterion (see above)
 
+### Performance
+The five criteria are independent I/O-bound checks and run concurrently in a thread pool; log output is consumed in a fixed order, so it reads exactly like a sequential run. The informational sections avoid per-node fan-out entirely: per-node instant usage is parsed from the single cached `oc adm top nodes` snapshot, and windowed per-node usage comes from one batched Prometheus query per metric instead of two round trips per node. The ML/GPU node usage display only gathers numbers in verbose mode, the only mode that shows them.
+
 ### Export Results
 Export to CSV (append mode) or JSON for automation and historical tracking.
 
@@ -193,7 +196,7 @@ uv sync
 ## Output Modes
 
 ### Verbose (default)
-Shows full details: node lists, metrics, operator pods, GPU information, recent events.
+Shows full details: node lists, metrics, operator pods, GPU information, ML/GPU node usage, recent events.
 
 ### Quiet (`-q`)
 Minimal output:

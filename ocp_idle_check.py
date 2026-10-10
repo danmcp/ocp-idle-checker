@@ -39,6 +39,13 @@ flags; the defaults are provisional.  "Baseline" is the median of the
 15-minute windows on the query_range path and the window mean on the
 aggregate fallback path.
 
+The five criteria run concurrently in a thread pool (they are independent
+I/O-bound checks); the log output is consumed in a fixed order so it reads
+exactly like the old sequential run.  The informational sections avoid
+per-node fan-out: per-node instant usage comes from the single cached
+`oc adm top nodes` snapshot, and windowed per-node usage from one batched
+Prometheus query per metric.
+
 Exit codes:
   0 = cluster is ACTIVE
   1 = cluster is IDLE
@@ -60,10 +67,13 @@ import ssl
 import statistics
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -387,6 +397,7 @@ class Oc:
         self.verbose = verbose
         self._nodes: list[dict[str, Any]] | None = None
         self._top_lines: list[str] | None = None
+        self._top_map: dict[str, tuple[float, float]] | None = None
         self._event_rows: list[str] | None = None
 
     def run(self, args: list[str], timeout: float = OC_TIMEOUT) -> str | None:
@@ -440,9 +451,15 @@ class Oc:
             self._top_lines = [ln for ln in (out or "").splitlines() if ln.strip()]
         return self._top_lines
 
-    def top_node(self, name: str) -> list[str]:
-        out = self.run(["adm", "top", "node", name, "--no-headers"])
-        return [ln for ln in (out or "").splitlines() if ln.strip()]
+    def top_node_map(self) -> dict[str, tuple[float, float]]:
+        """Per-node (CPU%, MEM%) parsed from the cached cluster-wide snapshot.
+
+        Replaces per-node `oc adm top node <name>` spawns — one snapshot
+        serves every consumer.
+        """
+        if self._top_map is None:
+            self._top_map = node_top_percentages(self.top_nodes())
+        return self._top_map
 
     def nodes(self) -> list[dict[str, Any]]:
         """Cached `oc get nodes -o json` items."""
@@ -494,23 +511,28 @@ class PrometheusClient:
         self._base_resolved = False
         self._token: str | None = token or None
         self._token_resolved = bool(token)
+        # The five criteria run in a thread pool; the lazy endpoint/token
+        # resolution below must happen exactly once for all of them.
+        self._init_lock = threading.Lock()
 
     def _base_url(self) -> str | None:
-        if not self._base_resolved:
-            self._base_resolved = True
-            override = os.environ.get(PROM_URL_OVERRIDE, "")
-            if override:
-                self._base = override.rstrip("/")
-            else:
-                host = self._oc.route_host()
-                self._base = f"https://{host}" if host else None
-        return self._base
+        with self._init_lock:
+            if not self._base_resolved:
+                self._base_resolved = True
+                override = os.environ.get(PROM_URL_OVERRIDE, "")
+                if override:
+                    self._base = override.rstrip("/")
+                else:
+                    host = self._oc.route_host()
+                    self._base = f"https://{host}" if host else None
+            return self._base
 
     def _bearer(self) -> str:
-        if not self._token_resolved:
-            self._token_resolved = True
-            self._token = self._oc.whoami_token() or self._oc.create_prometheus_token()
-        return self._token or ""
+        with self._init_lock:
+            if not self._token_resolved:
+                self._token_resolved = True
+                self._token = self._oc.whoami_token() or self._oc.create_prometheus_token()
+            return self._token or ""
 
     def _get_json(self, path: str, params: dict[str, str], timeout: float) -> dict[str, Any] | None:
         base = self._base_url()
@@ -668,6 +690,24 @@ def instant_averages(top_lines: list[str]) -> tuple[float | None, float | None]:
     cpu_avg = sum(cpu_values) / len(cpu_values) if cpu_values else None
     mem_avg = sum(mem_values) / len(mem_values) if mem_values else None
     return cpu_avg, mem_avg
+
+
+def node_top_percentages(top_lines: list[str]) -> dict[str, tuple[float, float]]:
+    """Per-node (CPU%, MEM%) from `oc adm top nodes` lines, keyed by node name.
+
+    Parses the same columns as `instant_averages` (CPU% = column 3,
+    MEM% = column 5); malformed rows are skipped.
+    """
+    stats: dict[str, tuple[float, float]] = {}
+    for line in top_lines:
+        fields = line.split()
+        if len(fields) < 5:
+            continue
+        try:
+            stats[fields[0]] = (float(fields[2].rstrip("%")), float(fields[4].rstrip("%")))
+        except ValueError:
+            continue
+    return stats
 
 
 def fmt2(value: float | None) -> str | None:
@@ -1101,40 +1141,73 @@ def compute_verdict(outcomes: list[CheckOutcome]) -> tuple[int, int, int, str, i
 # === INFORMATIONAL (non-voting) SECTIONS ===================================
 
 
+def instant_by_instance(series: list[dict[str, Any]] | None) -> dict[str, float]:
+    """Reduce instant-query series to {instance label: value}; junk skipped."""
+    out: dict[str, float] = {}
+    for entry in series or []:
+        instance = str(entry.get("metric", {}).get("instance", ""))
+        try:
+            value = float(entry["value"][1])
+        except (KeyError, IndexError, TypeError, ValueError):
+            continue
+        if math.isfinite(value):
+            out[instance] = value
+    return out
+
+
+def average_matching(by_instance: dict[str, float], pattern: re.Pattern[str]) -> float | None:
+    """Mean of the values whose instance label matches `pattern`.
+
+    Prometheus `=~` matchers are fully anchored, so the Python equivalent
+    of a node's `instance=~"<name>.*"` selector is `pattern.fullmatch`.
+    """
+    values = [value for instance, value in by_instance.items() if pattern.fullmatch(instance)]
+    return sum(values) / len(values) if values else None
+
+
 def gpu_usage_section(
     cfg: Config, oc: Oc, prom: PrometheusClient, gpu_nodes: list[GpuNode]
 ) -> dict[str, Any]:
     """GPU node CPU/memory usage for the report (node resources, not GPU
-    utilization - that now lives in the gpu criterion)."""
+    utilization - that now lives in the gpu criterion).
+
+    Per-node instant numbers come from the single cached `adm top nodes`
+    snapshot, and the windowed numbers from one batched query per metric
+    over all GPU nodes (`avg by (instance)` keeps the series separable so
+    they can be mapped back per node) instead of two round trips per node.
+    """
+    top = oc.top_node_map()
     cpu_current: list[float] = []
     mem_current: list[float] = []
     for node in gpu_nodes:
-        for line in oc.top_node(node.name):
-            fields = line.split()
-            if len(fields) < 5:
-                continue
-            try:
-                cpu_current.append(float(fields[2].rstrip("%")))
-                mem_current.append(float(fields[4].rstrip("%")))
-            except ValueError:
-                continue
+        stats = top.get(node.name)
+        if stats is not None:
+            cpu_current.append(stats[0])
+            mem_current.append(stats[1])
 
     cpu_windowed: list[float] = []
     mem_windowed: list[float] = []
-    if cfg.time_window_minutes > 0:
-        for node in gpu_nodes:
-            pattern = f"{re.escape(node.name)}.*"
-            cpu = prom.query(
-                '(1 - avg(rate(node_cpu_seconds_total{mode="idle",'
+    if cfg.time_window_minutes > 0 and gpu_nodes:
+        pattern = "|".join(f"{re.escape(node.name)}.*" for node in gpu_nodes)
+        cpu_by_instance = instant_by_instance(
+            prom.query_all(
+                '(1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle",'
                 f'instance=~"{pattern}"}}[{cfg.time_window_minutes}m]))) * 100'
             )
-            if cpu is not None:
-                cpu_windowed.append(cpu)
-            mem = prom.query(
-                "(1 - avg_over_time((avg(node_memory_MemAvailable_bytes"
-                f'{{instance=~"{pattern}"}}) / avg(node_memory_MemTotal_bytes'
+        )
+        mem_by_instance = instant_by_instance(
+            prom.query_all(
+                "(1 - avg_over_time((avg by (instance) (node_memory_MemAvailable_bytes"
+                f'{{instance=~"{pattern}"}}) / avg by (instance) (node_memory_MemTotal_bytes'
                 f'{{instance=~"{pattern}"}}))[{cfg.time_window_minutes}m:])) * 100'
             )
+        )
+        for node in gpu_nodes:
+            node_pattern = re.compile(f"{re.escape(node.name)}.*")
+            cpu = average_matching(cpu_by_instance, node_pattern)
+            if cpu is not None:
+                cpu_windowed.append(cpu)
+            mem = average_matching(mem_by_instance, node_pattern)
             if mem is not None:
                 mem_windowed.append(mem)
 
@@ -1152,9 +1225,13 @@ def gpu_usage_section(
 def ml_node_report(
     cfg: Config, oc: Oc, prom: PrometheusClient, items: list[dict[str, Any]]
 ) -> bool:
-    """Verbose-only ML node usage display (informational, never votes).
+    """ML node usage display (informational, never votes).
 
-    Returns whether any ML/GPU instance-type nodes were found.
+    The instance-type pattern match runs in every mode because the return
+    value feeds the "expensive nodes are idle" warning. The per-node usage
+    numbers - one cached `adm top nodes` snapshot plus one batched windowed
+    query over all matched nodes - are only gathered in verbose mode, the
+    only mode that displays them.
     """
     pattern = re.compile(cfg.ml_node_pattern)
     ml_nodes = [item for item in items if pattern.search(node_instance_type(item))]
@@ -1163,25 +1240,28 @@ def ml_node_report(
         return False
 
     log_info(f"Found {len(ml_nodes)} ML/GPU instance-type nodes:")
-    for item in ml_nodes:
-        name = item.get("metadata", {}).get("name", "")
-        instance = node_instance_type(item)
-        cpu = mem = None
-        for line in oc.top_node(str(name)):
-            fields = line.split()
-            if len(fields) >= 5:
-                try:
-                    cpu = float(fields[2].rstrip("%"))
-                    mem = float(fields[4].rstrip("%"))
-                except ValueError:
-                    pass
-        windowed = None
-        if cfg.time_window_minutes > 0:
-            windowed = prom.query(
-                f'(1 - avg(rate(node_cpu_seconds_total{{mode="idle",'
-                f'instance=~"{re.escape(str(name))}.*"}}'
+    if not cfg.verbose:
+        return True
+
+    top = oc.top_node_map()
+    windowed_cpu: dict[str, float] = {}
+    if cfg.time_window_minutes > 0:
+        names = [str(item.get("metadata", {}).get("name", "")) for item in ml_nodes]
+        instance_pattern = "|".join(f"{re.escape(name)}.*" for name in names)
+        windowed_cpu = instant_by_instance(
+            prom.query_all(
+                f'(1 - avg by (instance) (rate(node_cpu_seconds_total{{mode="idle",'
+                f'instance=~"{instance_pattern}"}}'
                 f"[{cfg.time_window_minutes}m]))) * 100"
             )
+        )
+    for item in ml_nodes:
+        name = str(item.get("metadata", {}).get("name", ""))
+        instance = node_instance_type(item)
+        cpu, mem = top.get(name, (None, None))
+        windowed = None
+        if windowed_cpu:
+            windowed = average_matching(windowed_cpu, re.compile(f"{re.escape(name)}.*"))
         log_info(
             f"  {name} ({instance}): instant cpu={fmt2(cpu)}% "
             f"mem={fmt2(mem)}%, windowed cpu={fmt2(windowed)}%"
@@ -1319,31 +1399,29 @@ def run(argv: list[str] | None = None) -> int:
     log_info(f"Nodes: {len(live_nodes)} ({len(gpu_nodes)} with GPUs)")
     log_info(f"Instant cluster CPU: {fmt2(instant_cpu)}%, memory: {fmt2(instant_mem)}%")
 
-    # --- CHECK 1: CPU ---
-    log_info("--- CHECK 1: CPU Utilization ---")
-    cpu_outcome = check_cpu(cfg, prom, live_nodes, instant_cpu)
-    log_info(f"CPU Result: {cpu_outcome.result}")
-
-    # --- CHECK 2: Memory ---
-    log_info("--- CHECK 2: Memory Utilization ---")
-    memory_outcome = check_memory(cfg, prom, instant_mem)
-    log_info(f"Memory Result: {memory_outcome.result}")
-
-    # --- CHECK 3: API server ---
-    log_info("--- CHECK 3: API Server Activity ---")
-    api_outcome = check_api(cfg, prom)
-    log_info(f"API Server Result: {api_outcome.result}")
-
-    # --- CHECK 4: GPU ---
-    log_info("--- CHECK 4: GPU Utilization ---")
-    gpu_outcome = check_gpu(cfg, prom, gpu_nodes)
-    log_info(f"GPU Result: {gpu_outcome.result}")
-
-    # --- CHECK 5: Operators ---
+    # --- CHECK 1-5: the five criteria, run concurrently ---
+    # They are independent I/O-bound checks; only the operators check spawns
+    # oc commands, and the Prometheus client resolves its endpoint and token
+    # exactly once under its init lock. Results are consumed in fixed order
+    # so the log output matches the old sequential run line for line, and an
+    # exception re-raises at the same check it would have in that run.
     now = datetime.now(UTC)
-    log_info("--- CHECK 5: Operators ---")
-    operators_outcome = check_operators(cfg, oc, now)
-    log_info(f"Operators Result: {operators_outcome.result}")
+    checks: list[tuple[str, str, Callable[[], CheckOutcome]]] = [
+        ("CPU Utilization", "CPU", lambda: check_cpu(cfg, prom, live_nodes, instant_cpu)),
+        ("Memory Utilization", "Memory", lambda: check_memory(cfg, prom, instant_mem)),
+        ("API Server Activity", "API Server", lambda: check_api(cfg, prom)),
+        ("GPU Utilization", "GPU", lambda: check_gpu(cfg, prom, gpu_nodes)),
+        ("Operators", "Operators", lambda: check_operators(cfg, oc, now)),
+    ]
+    with ThreadPoolExecutor(max_workers=len(checks)) as pool:
+        futures = [pool.submit(run_check) for _, _, run_check in checks]
+        outcomes: list[CheckOutcome] = []
+        for number, ((title, label, _), future) in enumerate(zip(checks, futures, strict=True), 1):
+            log_info(f"--- CHECK {number}: {title} ---")
+            outcome = future.result()
+            log_info(f"{label} Result: {outcome.result}")
+            outcomes.append(outcome)
+    cpu_outcome, memory_outcome, api_outcome, gpu_outcome, operators_outcome = outcomes
 
     # --- Informational (never votes) ---
     ml_found = False

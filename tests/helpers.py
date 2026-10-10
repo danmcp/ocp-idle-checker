@@ -182,19 +182,21 @@ def gpu_avg_query(minutes: int) -> str:
     return f"avg_over_time(DCGM_FI_DEV_GPU_UTIL[{minutes}m])"
 
 
-def node_cpu_window_query(node: str, minutes: int) -> str:
-    pattern = f"{re.escape(node)}.*"
+def node_cpu_window_query(nodes: list[str], minutes: int) -> str:
+    """The batched per-node windowed CPU query (one round trip for all nodes)."""
+    pattern = "|".join(f"{re.escape(node)}.*" for node in nodes)
     return (
-        '(1 - avg(rate(node_cpu_seconds_total{mode="idle",'
+        '(1 - avg by (instance) (rate(node_cpu_seconds_total{mode="idle",'
         f'instance=~"{pattern}"}}[{minutes}m]))) * 100'
     )
 
 
-def node_mem_window_query(node: str, minutes: int) -> str:
-    pattern = f"{re.escape(node)}.*"
+def node_mem_window_query(nodes: list[str], minutes: int) -> str:
+    """The batched per-node windowed memory query (one round trip for all nodes)."""
+    pattern = "|".join(f"{re.escape(node)}.*" for node in nodes)
     return (
-        "(1 - avg_over_time((avg(node_memory_MemAvailable_bytes"
-        f'{{instance=~"{pattern}"}}) / avg(node_memory_MemTotal_bytes'
+        "(1 - avg_over_time((avg by (instance) (node_memory_MemAvailable_bytes"
+        f'{{instance=~"{pattern}"}}) / avg by (instance) (node_memory_MemTotal_bytes'
         f'{{instance=~"{pattern}"}}))[{minutes}m:])) * 100'
     )
 
@@ -205,6 +207,15 @@ def prom_instant_json(value: str) -> str:
         '{"status":"success","data":{"resultType":"vector","result":'
         f'[{{"metric":{{}},"value":[1700000000,"{value}"]}}]}}}}'
     )
+
+
+def prom_instant_series_json(series: dict[str, str]) -> str:
+    """A successful instant-query response with one series per instance label."""
+    result = [
+        {"metric": {"instance": instance}, "value": [1700000000, value]}
+        for instance, value in series.items()
+    ]
+    return json.dumps({"status": "success", "data": {"resultType": "vector", "result": result}})
 
 
 def prom_range_json(series: list[dict]) -> str:

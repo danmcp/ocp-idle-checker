@@ -28,6 +28,7 @@ from helpers import (
     node_mem_window_query,
     pod_row,
     prom_instant_json,
+    prom_instant_series_json,
     prom_range_json,
     rs_row,
     ts_before,
@@ -280,10 +281,12 @@ def test_gpu_cluster_adds_fifth_criterion(monkeypatch, prom_server, tmp_path):
     oc_responses[("get", "rs", "-A", "-o", oic.REPLICASETS_ALL_JSONPATH)] = (
         OPERATOR_REPLICASETS_YOUNG
     )
-    oc_responses[("adm", "top", "node", "gpu-node-1", "--no-headers")] = (
-        "gpu-node-1 500m 3% 8000Mi 6%\n"
+    # Per-node instant usage comes from the cluster-wide snapshot: the GPU
+    # node has its own line there, and no per-node `adm top node` may run.
+    oc_responses[("adm", "top", "nodes", "--no-headers")] = (
+        "node-1 250m 2% 3212Mi 5%\ngpu-node-1 500m 3% 8000Mi 6%\n"
     )
-    install_fake_oc(monkeypatch, oc_responses)
+    calls = install_fake_oc(monkeypatch, oc_responses)
 
     quiet_cpu(responses, ["node-1"])
     quiet_memory_and_api(responses)
@@ -291,18 +294,20 @@ def test_gpu_cluster_adds_fifth_criterion(monkeypatch, prom_server, tmp_path):
     responses[("/api/v1/query_range", oic.GPU_RANGE_QUERY)] = prom_range_json(
         [make_dcgm_series(["0", "0", "0", "80"])]
     )
-    # Per-node windowed usage queries from the gpu report and ML node check.
-    responses[("/api/v1/query", node_cpu_window_query("gpu-node-1", WINDOW))] = prom_instant_json(
-        "7"
+    # Batched windowed usage queries from the gpu report (the ML node
+    # display is verbose-only, so a quiet run never issues its query).
+    responses[("/api/v1/query", node_cpu_window_query(["gpu-node-1"], WINDOW))] = (
+        prom_instant_series_json({"gpu-node-1:9100": "7"})
     )
-    responses[("/api/v1/query", node_mem_window_query("gpu-node-1", WINDOW))] = prom_instant_json(
-        "11"
+    responses[("/api/v1/query", node_mem_window_query(["gpu-node-1"], WINDOW))] = (
+        prom_instant_series_json({"gpu-node-1:9100": "11"})
     )
 
     json_path = tmp_path / "report.json"
     exit_code = oic.run(["-q", "--json", str(json_path), "-w", str(WINDOW)])
     assert exit_code == 0
 
+    assert ("adm", "top", "node", "gpu-node-1", "--no-headers") not in calls
     report = json.loads(json_path.read_text())
     criteria = report["criteria"]
     # Five criteria now; cpu, memory, and api vote IDLE - 3 of 5 is below 80%.
@@ -319,6 +324,45 @@ def test_gpu_cluster_adds_fifth_criterion(monkeypatch, prom_server, tmp_path):
         "cpu_windowed": "7.00",
         "memory_windowed": "11.00",
     }
+
+
+def test_verbose_gpu_cluster_reports_ml_nodes(monkeypatch, prom_server, tmp_path, capsys):
+    """Verbose mode adds the ML node display: per-node instant numbers from
+    the cluster-wide top snapshot and one batched windowed query per metric,
+    with no per-node `oc adm top node` spawns."""
+    url, responses = prom_server
+    monkeypatch.setenv("OCP_IDLE_PROMETHEUS_URL", url)
+    nodes = [node_item("node-1"), node_item("gpu-node-1", instance_type="g5.xlarge", gpus="4")]
+    oc_responses = base_oc_responses(nodes)
+    oc_responses[("adm", "top", "nodes", "--no-headers")] = (
+        "node-1 250m 2% 3212Mi 5%\ngpu-node-1 500m 3% 8000Mi 6%\n"
+    )
+    calls = install_fake_oc(monkeypatch, oc_responses)
+
+    quiet_cpu(responses, ["node-1"])
+    quiet_memory_and_api(responses)
+    responses[("/api/v1/query_range", oic.GPU_RANGE_QUERY)] = prom_range_json(
+        [make_dcgm_series(["0"] * 8)]
+    )
+    # The gpu report and the ML node display cover the same node, so their
+    # batched queries are identical strings served by the same entry.
+    responses[("/api/v1/query", node_cpu_window_query(["gpu-node-1"], WINDOW))] = (
+        prom_instant_series_json({"gpu-node-1:9100": "7"})
+    )
+    responses[("/api/v1/query", node_mem_window_query(["gpu-node-1"], WINDOW))] = (
+        prom_instant_series_json({"gpu-node-1:9100": "11"})
+    )
+
+    json_path = tmp_path / "report.json"
+    exit_code = oic.run(["--json", str(json_path), "-w", str(WINDOW)])
+    assert exit_code == 1
+
+    stderr = capsys.readouterr().err
+    assert "Found 1 ML/GPU instance-type nodes:" in stderr
+    assert "gpu-node-1 (g5.xlarge): instant cpu=3.00% mem=6.00%, windowed cpu=7.00%" in stderr
+    assert "Expensive GPU/ML nodes are idle - review before cleanup" in stderr
+    # Instant per-node numbers come from the cluster-wide snapshot.
+    assert ("adm", "top", "node", "gpu-node-1", "--no-headers") not in calls
 
 
 def test_csv_export_appends_with_header(monkeypatch, prom_server, tmp_path):

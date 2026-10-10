@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import threading
 import urllib.parse
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import ClassVar
 
 import pytest
@@ -43,9 +43,12 @@ class _PromHandler(BaseHTTPRequestHandler):
 
 @pytest.fixture
 def prom_server():
-    """A local HTTP server standing in for thanos-querier."""
+    """A local HTTP server standing in for thanos-querier.
+
+    ThreadingHTTPServer because the five criteria query it concurrently.
+    """
     _PromHandler.responses = {}
-    server = HTTPServer(("127.0.0.1", 0), _PromHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _PromHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
