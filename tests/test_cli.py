@@ -27,7 +27,7 @@ def test_defaults():
 
 def test_spike_rule_defaults():
     cfg = oic.parse_args([])
-    assert cfg.cpu_peak_threshold == 40.0
+    assert cfg.cpu_peak_threshold == 30.0
     assert cfg.cpu_shape_ratio == 2.0
     assert cfg.gpu_peak_threshold == 40.0
     assert cfg.gpu_shape_ratio == 2.0

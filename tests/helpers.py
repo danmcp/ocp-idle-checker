@@ -76,7 +76,7 @@ def base_config(**overrides) -> oic.Config:
         event_history_minutes=60,
         check_ml_nodes=True,
         ml_node_pattern="p5|p4d|g5",
-        cpu_peak_threshold=40.0,
+        cpu_peak_threshold=30.0,
         cpu_shape_ratio=2.0,
         gpu_peak_threshold=40.0,
         gpu_shape_ratio=2.0,

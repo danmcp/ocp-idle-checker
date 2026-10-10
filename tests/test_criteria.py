@@ -57,15 +57,15 @@ def test_cpu_active_on_peak():
 
 
 def test_cpu_active_on_shape_ratio():
-    # Median 5%, peak 35%: no window crossed the peak threshold, but the
-    # 7x peak clears the 5.66x the scaled rule requires at a median of 5.
-    prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["5", "5", "35"])]})
+    # Median 5%, peak 28%: no window crossed the peak threshold, but the
+    # 5.6x peak clears the 4.9x the scaled rule requires at a median of 5.
+    prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["5", "5", "28"])]})
     outcome = oic.check_cpu(base_config(), prom, {"node-1"}, None)
     assert outcome.result == "ACTIVE"
     assert outcome.entry["peak_exceeded"] is False
     assert outcome.entry["shape_exceeded"] is True
-    assert outcome.entry["ratio"] == 7.0
-    assert outcome.entry["required_ratio"] == pytest.approx(5.66, abs=0.01)
+    assert outcome.entry["ratio"] == 5.6
+    assert outcome.entry["required_ratio"] == pytest.approx(4.9, abs=0.01)
 
 
 def test_cpu_quiet_cluster_is_idle():
@@ -87,7 +87,7 @@ def test_cpu_quiet_cluster_is_idle():
 
 def test_cpu_small_burst_on_quiet_median_is_idle():
     # Median 2%, peak 10%: a 5x burst, but the scaled requirement at a 2%
-    # median is 8.94x - the soft floor keeps proportionally small bursts on
+    # median is 7.75x - the soft floor keeps proportionally small bursts on
     # quiet baselines from voting ACTIVE (the no-floor behavior this
     # replaces).
     prom = FakeProm(
@@ -102,11 +102,11 @@ def test_cpu_small_burst_on_quiet_median_is_idle():
     assert outcome.result == "IDLE"
     assert outcome.entry["peak_exceeded"] is False
     assert outcome.entry["shape_exceeded"] is False
-    assert outcome.entry["required_ratio"] == pytest.approx(8.94, abs=0.01)
+    assert outcome.entry["required_ratio"] == pytest.approx(7.75, abs=0.01)
 
 
 def test_cpu_large_burst_on_quiet_median_is_active():
-    # Median 2%, peak 20%: 10x clears the 8.94x requirement.
+    # Median 2%, peak 20%: 10x clears the 7.75x requirement.
     prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["2", "2", "20"])]})
     outcome = oic.check_cpu(base_config(), prom, {"node-1"}, 2.0)
     assert outcome.result == "ACTIVE"
@@ -148,7 +148,7 @@ def test_cpu_single_bursty_node_among_steady_siblings_is_active():
         ranges={
             oic.CPU_RANGE_QUERY: [
                 make_range_series("node-1", ["5"] * 10),
-                make_range_series("node-2", ["5"] * 10 + ["35"]),
+                make_range_series("node-2", ["5"] * 10 + ["28"]),
                 make_range_series("node-3", ["8"] * 11),
             ]
         }
@@ -157,7 +157,7 @@ def test_cpu_single_bursty_node_among_steady_siblings_is_active():
     assert outcome.result == "ACTIVE"
     assert outcome.entry["shape_exceeded"] is True
     assert outcome.entry["node"] == "node-2"  # the driver, not a sibling
-    assert outcome.entry["ratio"] == 7.0
+    assert outcome.entry["ratio"] == 5.6
     per_node = {e["node"]: e for e in outcome.entry["per_node"]}
     assert per_node["node-2"]["shape_exceeded"] is True
     assert per_node["node-1"]["shape_exceeded"] is False

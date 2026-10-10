@@ -108,7 +108,7 @@ EVENT_TIME_MINUTES = 60
 ML_NODE_PATTERN = "p5|p4d|g5"
 
 # Spike/shape rule defaults - fleet-calibration knobs, ideal values TBD.
-CPU_PEAK_THRESHOLD = 40.0  # percent; any 15-min window above this = ACTIVE
+CPU_PEAK_THRESHOLD = 30.0  # percent; any 15-min window above this = ACTIVE
 CPU_SHAPE_RATIO = 2.0  # burst multiplier required at a peak-threshold baseline
 GPU_PEAK_THRESHOLD = 40.0
 GPU_SHAPE_RATIO = 2.0  # burst multiplier required at a peak-threshold baseline

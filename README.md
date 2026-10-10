@@ -31,7 +31,7 @@ Each criterion is evaluated independently and can be `IDLE`, `ACTIVE`, `UNKNOWN`
 
 | Criterion | Votes ACTIVE when |
 |-----------|-------------------|
-| **CPU** | any node's 15-minute window > 40%, or any node's window peak clearing a baseline-scaled multiple of its own median window (2× at a 40% median, steeper on quieter medians); an instant `oc adm top nodes` reading ≥ 15% can also flip an otherwise-IDLE result |
+| **CPU** | any node's 15-minute window > 30%, or any node's window peak clearing a baseline-scaled multiple of its own median window (2× at a 30% median, steeper on quieter medians); an instant `oc adm top nodes` reading ≥ 15% can also flip an otherwise-IDLE result |
 | **Memory** | the time-windowed average ≥ 35%, or an instant snapshot ≥ 35% (one-directional override) |
 | **API Server** | the time-windowed average ≥ 100 req/sec, or any 15-minute window clearing a baseline-scaled multiple of the median window (2× at a 100 req/s median, steeper on quieter medians) while above 50 req/s |
 | **GPU** | any node's 15-minute window > 40%, or any node's window peak clearing a baseline-scaled multiple of its own median window (DCGM GPU utilization) |
@@ -43,19 +43,18 @@ A criterion votes IDLE when none of its ACTIVE conditions hold. Some criteria ca
 
 The CPU and GPU criteria take per-node 15-minute window averages from the Prometheus `query_range` matrix and evaluate **each node against its own history**: a steady busy node pooled with a quiet sibling is two steady nodes, not a burst, so pooling the cluster's windows into one median (the old behavior) is gone. The criterion votes ACTIVE when any node is individually bursty:
 
-- **Peak rule**: any node's 15-minute window averaged above the peak threshold (default 40%), **or**
+- **Peak rule**: any node's 15-minute window averaged above the peak threshold (30% for CPU, 40% for GPU), **or**
 - **Shape rule**: a node's window peak clears a **baseline-scaled multiple** of that node's own median window.
 
 The required multiple is `shape-ratio` (default 2×) when the node's median sits at the peak threshold, and grows with the square root of the shortfall as the median drops — a soft floor in place of the absolute one this rule once had:
 
-| node median (CPU/GPU) | required multiple | peak needed |
+| node median | required multiple | peak needed |
 |---|---|---|
-| 40% (threshold) | 2× | 80% |
-| 10% (quarter) | 4× | 40% |
-| 2.5% | 8× | 20% |
-| 1% | 12.6× | 12.6% |
+| at the peak threshold (30% CPU / 40% GPU) | 2× | 60% / 80% |
+| a quarter of it (7.5% / 10%) | 4× | 30% / 40% |
+| a sixteenth of it | 8× | 15% / 20% |
 
-So a quiet baseline needs a proportionally bigger burst before the shape rule fires: a 2% median with a 10% peak is a 5× variation but stays IDLE, while a 20% peak (10×) counts as bursty. The multiple never drops below `shape-ratio` above the threshold. Below a quarter of the threshold the shape rule is the sensitive branch; at or above it the peak threshold takes over. A zero baseline with a nonzero peak still counts as an unbounded ratio and trips the shape rule, per node.
+So a quiet baseline needs a proportionally bigger burst before the shape rule fires: a 2% median with a 10% peak is a 5× variation but stays IDLE, while a 20% peak (10×) counts as bursty. The multiple never drops below `shape-ratio` above the threshold. Below a quarter of the threshold the shape rule is the sensitive branch; at or above it the peak threshold takes over. A zero baseline with a nonzero peak still counts as an unbounded ratio and trips the shape rule, per node. Fleet calibration put the CPU peak threshold at 30%: the 30-40% max-peak band is sustained workloads the shape rule cannot see (a steady node sits near its own median), idle exemplars peak below 20%, and the highest one-off blip below 40% sits at 26.9%.
 
 The criteria JSON detail exports each node's peak, median, ratio, and required multiple (`per_node`), with the cluster-level summary reporting the pooled peak plus the baseline/ratio of the most burst-shaped node (`node`, `required_ratio`).
 
@@ -107,7 +106,7 @@ CPU and memory `UNKNOWN` still count toward the denominator (they never help the
 | `--operator-namespaces NS` | Namespaces always included in the operator scan (the scan covers every namespace except the excluded prefixes) | opendatahub,redhat-ods-operator,redhat-ods-applications |
 | `--operator-exclude-prefixes PREFIX,...` | Namespace prefixes excluded from the operator scan | openshift-,kube-,open-cluster-management- |
 | `--operator-event-hours HOURS` | Reconciliation event window for the operators criterion | 48 |
-| `--cpu-peak-threshold N` | CPU: any 15-min window above this % = ACTIVE | 40 |
+| `--cpu-peak-threshold N` | CPU: any 15-min window above this % = ACTIVE | 30 |
 | `--cpu-shape-ratio N` | CPU: burst multiplier the peak must clear when a node median is at the peak threshold; quieter medians require more | 2 |
 | `--gpu-peak-threshold N` | GPU: any 15-min window above this % = ACTIVE | 40 |
 | `--gpu-shape-ratio N` | GPU: burst multiplier the peak must clear when a node median is at the peak threshold; quieter medians require more | 2 |
