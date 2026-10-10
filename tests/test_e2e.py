@@ -209,11 +209,11 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
         "operator_event_window_hours",
         "operator_exclude_prefixes",
         "cpu_peak_threshold",
-        "cpu_shape_ratio",
+        "cpu_variance_ratio",
         "gpu_peak_threshold",
-        "gpu_shape_ratio",
-        "api_spike_ratio",
-        "api_spike_floor",
+        "gpu_variance_ratio",
+        "api_variance_ratio",
+        "api_variance_floor",
     ]
     criteria = report["criteria"]
     assert list(criteria) == [
@@ -228,7 +228,7 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
     ]
     assert (criteria["total"], criteria["met"], criteria["threshold"]) == (4, 4, 3)
     assert criteria["cpu"]["result"] == "IDLE"
-    assert criteria["cpu"]["source"] == "spike/shape over 15m windows"
+    assert criteria["cpu"]["source"] == "variance over 15m windows"
     assert criteria["cpu"]["peak"] == 2.0
     assert criteria["operators"]["age_days"] == 12.0
     assert criteria["operators"]["events"] == 0

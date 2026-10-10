@@ -51,12 +51,12 @@ def test_cpu_active_on_peak():
     entry = outcome.entry
     assert entry["peak"] == 45.0
     assert entry["peak_exceeded"] is True
-    assert entry["shape_exceeded"] is False
+    assert entry["variance_exceeded"] is False
     assert entry["value"] == "45.00"
-    assert entry["source"] == "spike/shape over 15m windows"
+    assert entry["source"] == "variance over 15m windows"
 
 
-def test_cpu_active_on_shape_ratio():
+def test_cpu_active_on_variance_ratio():
     # Median 5%, peak 28%: no window crossed the peak threshold, but the
     # peak clears the required 14.4% (a 2.9x multiple) the cube-root curve
     # demands at a median of 5.
@@ -64,7 +64,7 @@ def test_cpu_active_on_shape_ratio():
     outcome = oic.check_cpu(base_config(), prom, {"node-1"}, None)
     assert outcome.result == "ACTIVE"
     assert outcome.entry["peak_exceeded"] is False
-    assert outcome.entry["shape_exceeded"] is True
+    assert outcome.entry["variance_exceeded"] is True
     assert outcome.entry["ratio"] == 5.6
     assert outcome.entry["required_ratio"] == pytest.approx(2.88, abs=0.01)
     assert outcome.entry["required_peak"] == pytest.approx(14.42, abs=0.01)
@@ -88,7 +88,7 @@ def test_cpu_quiet_cluster_is_idle():
 
 
 def test_cpu_small_burst_on_quiet_median_is_active():
-    # Median 2%, peak 10%: the motivating shape - a workload that idles at
+    # Median 2%, peak 10%: the motivating pattern - a workload that idles at
     # 2% and loads to 10% is active.  The required peak at a 2% median is
     # 7.8%, so the 10% peak clears it; below it (7%) stays idle.
     prom = FakeProm(
@@ -102,11 +102,11 @@ def test_cpu_small_burst_on_quiet_median_is_active():
     outcome = oic.check_cpu(base_config(), prom, {"node-1", "node-2"}, 2.0)
     assert outcome.result == "ACTIVE"
     assert outcome.entry["peak_exceeded"] is False
-    assert outcome.entry["shape_exceeded"] is True
+    assert outcome.entry["variance_exceeded"] is True
     assert outcome.entry["required_peak"] == pytest.approx(7.83, abs=0.01)
     per_node = {e["node"]: e for e in outcome.entry["per_node"]}
-    assert per_node["node-1"]["shape_exceeded"] is True
-    assert per_node["node-2"]["shape_exceeded"] is False
+    assert per_node["node-1"]["variance_exceeded"] is True
+    assert per_node["node-2"]["variance_exceeded"] is False
 
 
 def test_cpu_large_burst_on_quiet_median_is_active():
@@ -115,11 +115,11 @@ def test_cpu_large_burst_on_quiet_median_is_active():
     outcome = oic.check_cpu(base_config(), prom, {"node-1"}, 2.0)
     assert outcome.result == "ACTIVE"
     assert outcome.entry["peak_exceeded"] is False
-    assert outcome.entry["shape_exceeded"] is True
+    assert outcome.entry["variance_exceeded"] is True
 
 
 def test_cpu_steady_busy_and_quiet_nodes_are_idle():
-    # The mmacik-sno shape that build 21 flipped: a steady ~17% node pooled
+    # The mmacik-sno pattern that build 21 flipped: a steady ~17% node pooled
     # with a steady ~2% node.  Pooled, the median lands between the modes
     # and the busy node's peak over it reads as a 2x+ burst; judged per
     # node, both are steady and the criterion stays IDLE.
@@ -133,7 +133,7 @@ def test_cpu_steady_busy_and_quiet_nodes_are_idle():
     )
     outcome = oic.check_cpu(base_config(), prom, {"busy-node", "quiet-node"}, 2.0)
     assert outcome.result == "IDLE"
-    assert outcome.entry["shape_exceeded"] is False
+    assert outcome.entry["variance_exceeded"] is False
     assert outcome.entry["peak"] == 19.5  # pooled max across nodes
     assert outcome.entry["value"] == "19.50"
     # The summary reports the node closest to its own requirement - the
@@ -143,12 +143,12 @@ def test_cpu_steady_busy_and_quiet_nodes_are_idle():
     assert outcome.entry["ratio"] == pytest.approx(1.15)  # 19.5/17, rounded as exported
     per_node = outcome.entry["per_node"]
     assert [e["node"] for e in per_node] == ["busy-node", "quiet-node"]
-    assert all(e["shape_exceeded"] is False for e in per_node)
+    assert all(e["variance_exceeded"] is False for e in per_node)
 
 
 def test_cpu_single_bursty_node_among_steady_siblings_is_active():
     # Per-node cuts both ways: one genuinely bursty node fires on its own
-    # shape even when pooled with steady siblings.
+    # variance even when pooled with steady siblings.
     prom = FakeProm(
         ranges={
             oic.CPU_RANGE_QUERY: [
@@ -160,17 +160,17 @@ def test_cpu_single_bursty_node_among_steady_siblings_is_active():
     )
     outcome = oic.check_cpu(base_config(), prom, {"node-1", "node-2", "node-3"}, 2.0)
     assert outcome.result == "ACTIVE"
-    assert outcome.entry["shape_exceeded"] is True
+    assert outcome.entry["variance_exceeded"] is True
     assert outcome.entry["node"] == "node-2"  # the driver, not a sibling
     assert outcome.entry["ratio"] == 5.6
     per_node = {e["node"]: e for e in outcome.entry["per_node"]}
-    assert per_node["node-2"]["shape_exceeded"] is True
-    assert per_node["node-1"]["shape_exceeded"] is False
-    assert per_node["node-3"]["shape_exceeded"] is False
+    assert per_node["node-2"]["variance_exceeded"] is True
+    assert per_node["node-1"]["variance_exceeded"] is False
+    assert per_node["node-3"]["variance_exceeded"] is False
 
 
 def test_cpu_dead_node_series_are_ignored():
-    # A deleted node's spiky history must not vote; only live nodes count.
+    # A deleted node's bursty history must not vote; only live nodes count.
     prom = FakeProm(
         ranges={
             oic.CPU_RANGE_QUERY: [
@@ -211,7 +211,7 @@ def test_cpu_legacy_fallback_idle():
     assert outcome.result == "IDLE"
 
 
-def test_cpu_instant_override_beats_idle_shape():
+def test_cpu_instant_override_beats_idle_variance():
     # Steady quiet windows, so the ACTIVE verdict comes from the instant
     # reading alone.
     prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["8", "8", "10"])]})
@@ -310,12 +310,12 @@ def test_api_quiet_is_idle():
     )
     outcome = oic.check_api(base_config(), prom)
     assert outcome.result == "IDLE"
-    assert outcome.entry["spike_active"] is False
+    assert outcome.entry["variance_active"] is False
 
 
-def test_api_spike_detector_marks_active():
+def test_api_variance_detector_marks_active():
     # Average 5 req/s is far below 100, but a 15-minute window hit 100 req/s:
-    # 10x the median and above the spike floor.
+    # 10x the median and above the variance floor.
     prom = FakeProm(
         instant={api_avg_query(WINDOW): 5.0},
         ranges={
@@ -326,45 +326,47 @@ def test_api_spike_detector_marks_active():
     )
     outcome = oic.check_api(base_config(), prom)
     assert outcome.result == "ACTIVE"
-    assert outcome.entry["spike_active"] is True
-    assert outcome.entry["spike_peak"] == 100.0
-    assert outcome.entry["spike_ratio"] == 10.0
-    # The requirement scales against the 100 req/s threshold: at a median
-    # of 10 it is 6.32x.
-    assert outcome.entry["spike_required_ratio"] == pytest.approx(6.32, abs=0.01)
+    assert outcome.entry["variance_active"] is True
+    assert outcome.entry["variance_peak"] == 100.0
+    assert outcome.entry["variance_ratio"] == 10.0
+    # At a median of 10 the curve demands 34.2 req/s, but the 50 floor
+    # stands above it, so the requirement is the floor: a 5x multiple.
+    assert outcome.entry["variance_required_ratio"] == pytest.approx(5.0, abs=0.01)
+    assert outcome.entry["variance_required_peak"] == pytest.approx(50.0)
 
 
-def test_api_spike_on_quiet_median_needs_a_bigger_burst():
-    # Median 25 req/s: the scaled requirement is 2*sqrt(100/25) = 4x, so a
-    # 3.6x burst to 90 req/s - above the absolute floor of 50 - is not a
-    # spike, while a 4.4x burst to 110 is.
+def test_api_variance_on_quiet_median_needs_a_bigger_burst():
+    # Median 25 req/s: the shared curve demands 2x25x(50/25)^(1/3) = 63
+    # req/s (~2.5x), so a burst to 55 - above the floor of 50 - is not
+    # variance, while a burst to 70 is.
     quiet = FakeProm(
         instant={api_avg_query(WINDOW): 25.0},
         ranges={
             oic.API_RANGE_QUERY: [
-                {"metric": {}, "values": [[i * 900, v] for i, v in enumerate(["25", "25", "90"])]}
+                {"metric": {}, "values": [[i * 900, v] for i, v in enumerate(["25", "25", "55"])]}
             ]
         },
     )
     outcome = oic.check_api(base_config(), quiet)
     assert outcome.result == "IDLE"
-    assert outcome.entry["spike_active"] is False
-    assert outcome.entry["spike_required_ratio"] == 4.0
+    assert outcome.entry["variance_active"] is False
+    assert outcome.entry["variance_required_ratio"] == pytest.approx(2.52, abs=0.01)
     loud = FakeProm(
         instant={api_avg_query(WINDOW): 25.0},
         ranges={
             oic.API_RANGE_QUERY: [
-                {"metric": {}, "values": [[i * 900, v] for i, v in enumerate(["25", "25", "110"])]}
+                {"metric": {}, "values": [[i * 900, v] for i, v in enumerate(["25", "25", "70"])]}
             ]
         },
     )
     outcome = oic.check_api(base_config(), loud)
     assert outcome.result == "ACTIVE"
-    assert outcome.entry["spike_active"] is True
+    assert outcome.entry["variance_active"] is True
 
 
-def test_api_steady_load_above_floor_is_not_a_spike():
-    # Peak 80 is above the floor of 50 but only 1x the median.
+def test_api_steady_load_above_floor_stays_idle():
+    # Peak 80 is above the floor of 50 but only 1x the median; a median
+    # above half the scale pins the requirement at 2x = 160 req/s.
     prom = FakeProm(
         instant={api_avg_query(WINDOW): 80.0},
         ranges={
@@ -375,8 +377,8 @@ def test_api_steady_load_above_floor_is_not_a_spike():
     assert outcome.result == "IDLE"  # 80 < 100 average threshold
 
 
-def test_api_spike_active_without_average():
-    # The average query failing does not sink the spike detector.
+def test_api_variance_active_without_average():
+    # The average query failing does not sink the variance detector.
     prom = FakeProm(
         ranges={
             oic.API_RANGE_QUERY: [
@@ -427,17 +429,17 @@ def test_gpu_active_on_peak():
     assert outcome.result == "ACTIVE"
     assert outcome.counted
     assert outcome.entry["value"] == "50.00"
-    assert outcome.entry["source"] == "spike/shape over 15m windows"
+    assert outcome.entry["source"] == "variance over 15m windows"
 
 
-def test_gpu_active_on_shape_ratio():
+def test_gpu_active_on_variance_ratio():
     prom = FakeProm(ranges={oic.GPU_RANGE_QUERY: [make_dcgm_series(["0", "0", "30"])]})
     outcome = oic.check_gpu(base_config(), prom, [gpu_node()])
     assert outcome.result == "ACTIVE"
     assert outcome.entry["peak_exceeded"] is False
-    assert outcome.entry["shape_exceeded"] is True  # zero baseline: the floor is the requirement
+    assert outcome.entry["variance_exceeded"] is True  # zero baseline: the floor is the requirement
     assert outcome.entry["ratio"] is None
-    assert outcome.entry["required_peak"] == pytest.approx(oic.GPU_SHAPE_FLOOR)
+    assert outcome.entry["required_peak"] == pytest.approx(oic.GPU_VARIANCE_FLOOR)
 
 
 def test_gpu_zero_baseline_below_the_floor_is_idle():
@@ -447,8 +449,8 @@ def test_gpu_zero_baseline_below_the_floor_is_idle():
     prom = FakeProm(ranges={oic.GPU_RANGE_QUERY: [make_dcgm_series(["0", "0", "3.3"])]})
     outcome = oic.check_gpu(base_config(), prom, [gpu_node()])
     assert outcome.result == "IDLE"
-    assert outcome.entry["shape_exceeded"] is False
-    assert outcome.entry["required_peak"] == pytest.approx(oic.GPU_SHAPE_FLOOR)
+    assert outcome.entry["variance_exceeded"] is False
+    assert outcome.entry["required_peak"] == pytest.approx(oic.GPU_VARIANCE_FLOOR)
 
 
 def test_gpu_quiet_is_idle():
@@ -460,7 +462,7 @@ def test_gpu_quiet_is_idle():
 
 def test_gpu_pools_all_dcgm_series():
     # Every exporter series votes, not just per-node medians: one card's
-    # spike among several quiet cards still marks the criterion ACTIVE.
+    # burst among several quiet cards still marks the criterion ACTIVE.
     # (All cards here share an instance, so they pool into one node.)
     prom = FakeProm(
         ranges={
@@ -477,7 +479,7 @@ def test_gpu_pools_all_dcgm_series():
 
 def test_gpu_groups_per_node_and_fires_on_one_bursty_node():
     # Two GPU nodes: cards on the same node pool into that node's windows,
-    # and one node's burst fires on its own shape while its sibling stays
+    # and one node's burst fires on its own variance while its sibling stays
     # steady.
     prom = FakeProm(
         ranges={
@@ -492,8 +494,8 @@ def test_gpu_groups_per_node_and_fires_on_one_bursty_node():
     assert outcome.result == "ACTIVE"
     assert outcome.entry["node"] == "gpu-b"  # the bursty node drives the summary
     per_node = {e["node"]: e for e in outcome.entry["per_node"]}
-    assert per_node["gpu-b"]["shape_exceeded"] is True
-    assert per_node["gpu-a"]["shape_exceeded"] is False
+    assert per_node["gpu-b"]["variance_exceeded"] is True
+    assert per_node["gpu-a"]["variance_exceeded"] is False
 
 
 def test_gpu_deleted_node_samples_still_vote():

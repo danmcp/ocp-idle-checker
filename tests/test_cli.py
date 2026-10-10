@@ -25,14 +25,14 @@ def test_defaults():
     assert cfg.json_path is None
 
 
-def test_spike_rule_defaults():
+def test_variance_rule_defaults():
     cfg = oic.parse_args([])
     assert cfg.cpu_peak_threshold == 30.0
-    assert cfg.cpu_shape_ratio == 2.0
+    assert cfg.cpu_variance_ratio == 2.0
     assert cfg.gpu_peak_threshold == 40.0
-    assert cfg.gpu_shape_ratio == 2.0
-    assert cfg.api_spike_ratio == 2.0
-    assert cfg.api_spike_floor == 50.0
+    assert cfg.gpu_variance_ratio == 2.0
+    assert cfg.api_variance_ratio == 2.0
+    assert cfg.api_variance_floor == 50.0
 
 
 def test_window_flag():
@@ -48,38 +48,47 @@ def test_no_ml_check_flag():
     assert oic.parse_args(["--no-ml-check"]).check_ml_nodes is False
 
 
-def test_spike_rule_flags():
+def test_variance_rule_flags():
     cfg = oic.parse_args(
         [
             "--cpu-peak-threshold",
             "55",
-            "--cpu-shape-ratio",
+            "--cpu-variance-ratio",
             "3",
             "--gpu-peak-threshold",
             "60",
-            "--gpu-shape-ratio",
+            "--gpu-variance-ratio",
             "2.5",
-            "--api-spike-ratio",
+            "--api-variance-ratio",
             "4",
-            "--api-spike-floor",
+            "--api-variance-floor",
             "75",
         ]
     )
     assert cfg.cpu_peak_threshold == 55.0
-    assert cfg.cpu_shape_ratio == 3.0
+    assert cfg.cpu_variance_ratio == 3.0
     assert cfg.gpu_peak_threshold == 60.0
-    assert cfg.gpu_shape_ratio == 2.5
-    assert cfg.api_spike_ratio == 4.0
-    assert cfg.api_spike_floor == 75.0
+    assert cfg.gpu_variance_ratio == 2.5
+    assert cfg.api_variance_ratio == 4.0
+    assert cfg.api_variance_floor == 75.0
 
 
-def test_removed_shape_floor_flags_are_rejected():
-    # The CPU/GPU shape floors were removed; passing them must fail loudly
+def test_removed_and_renamed_variance_flags_are_rejected():
+    # The CPU/GPU variance floors were removed outright, and the ratio/floor
+    # flags were renamed to *-variance-*; old spellings must fail loudly
     # rather than be silently ignored.
     with pytest.raises(SystemExit):
         oic.parse_args(["--cpu-shape-floor", "20"])
     with pytest.raises(SystemExit):
         oic.parse_args(["--gpu-shape-floor", "20"])
+    with pytest.raises(SystemExit):
+        oic.parse_args(["--cpu-shape-ratio", "3"])
+    with pytest.raises(SystemExit):
+        oic.parse_args(["--gpu-shape-ratio", "3"])
+    with pytest.raises(SystemExit):
+        oic.parse_args(["--api-spike-ratio", "4"])
+    with pytest.raises(SystemExit):
+        oic.parse_args(["--api-spike-floor", "75"])
 
 
 def test_legacy_flags_still_parse():
