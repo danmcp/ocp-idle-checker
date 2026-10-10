@@ -109,9 +109,11 @@ ML_NODE_PATTERN = "p5|p4d|g5"
 
 # Spike/shape rule defaults - fleet-calibration knobs, ideal values TBD.
 CPU_PEAK_THRESHOLD = 30.0  # percent; any 15-min window above this = ACTIVE
-CPU_SHAPE_RATIO = 2.0  # burst multiplier required at a peak-threshold baseline
+CPU_SHAPE_RATIO = 2.0  # burst multiple required at half the peak threshold
+CPU_SHAPE_FLOOR = 1.0  # percent; minimum peak the burst rule demands on a zero baseline
 GPU_PEAK_THRESHOLD = 40.0
-GPU_SHAPE_RATIO = 2.0  # burst multiplier required at a peak-threshold baseline
+GPU_SHAPE_RATIO = 2.0  # burst multiple required at half the peak threshold
+GPU_SHAPE_FLOOR = 5.0  # percent; DCGM's idle noise tail reads 1-4% on a GPU doing nothing
 API_SPIKE_RATIO = 2.0  # burst multiplier required at a request-threshold baseline
 API_SPIKE_FLOOR = 50.0  # requests/sec; peak must reach this for the ratio to count
 
@@ -332,7 +334,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         type=float,
         default=CPU_SHAPE_RATIO,
         metavar="N",
-        help="CPU spike rule: burst multiplier the peak must clear when a node median is at the peak threshold; quieter medians require more (default: %(default)s)",
+        help="CPU spike rule: burst multiple the peak must clear when a node median is at half the peak threshold; quieter medians require more (default: %(default)s)",
     )
     parser.add_argument(
         "--gpu-peak-threshold",
@@ -346,7 +348,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         type=float,
         default=GPU_SHAPE_RATIO,
         metavar="N",
-        help="GPU spike rule: burst multiplier the peak must clear when a node median is at the peak threshold; quieter medians require more (default: %(default)s)",
+        help="GPU spike rule: burst multiple the peak must clear when a node median is at half the peak threshold; quieter medians require more (default: %(default)s)",
     )
     parser.add_argument(
         "--api-spike-ratio",
@@ -736,7 +738,10 @@ class ShapeStats:
     peak: float
     baseline: float  # median of windows (query_range) or window mean (fallback)
     ratio: float | None  # peak / baseline; None when the baseline is zero
-    required_ratio: float | None  # scaled multiple the peak must clear; None = unbounded
+    required_ratio: (
+        float | None
+    )  # scaled multiple the peak must clear; None when the baseline is zero
+    required_peak: float | None  # absolute peak the burst rule demands; None for the API spike rule
     peak_exceeded: bool
     shape_exceeded: bool
     node: str = ""  # set by per-node evaluation; empty when not node-scoped
@@ -749,24 +754,43 @@ class ShapeStats:
 def shape_required_ratio(
     baseline: float, ratio_threshold: float, ratio_scale: float
 ) -> float | None:
-    """Baseline-scaled burst multiplier the shape rule demands.
+    """Baseline-scaled burst multiplier the API spike rule demands.
 
     The peak must clear ratio_threshold times the baseline when the baseline
-    sits at ratio_scale - the criterion's normal threshold (peak threshold
-    for CPU/GPU, request-rate threshold for the API spike rule).  A quieter
-    baseline demands a larger multiple, growing with the square root of the
-    shortfall: 2x at the scale, 4x at a quarter of it, 8x at a sixteenth.
-    Above the scale the multiple is pinned at ratio_threshold, never lower.
-    This is the soft floor that replaces the absolute one the rule once
-    had: quiet baselines need proportionally bigger bursts before they
-    count as bursty, without a hard cutoff.
+    sits at ratio_scale - the request-rate threshold.  A quieter baseline
+    demands a larger multiple, growing with the square root of the shortfall:
+    2x at the scale, 4x at a quarter of it, 8x at a sixteenth.  Above the
+    scale the multiple is pinned at ratio_threshold, never lower.
 
-    A zero baseline is an unbounded ratio (None); the caller fires on any
-    nonzero peak, as before.
+    A zero baseline is an unbounded ratio (None); the caller's floor decides
+    whether the peak counts.
     """
     if baseline <= 0:
         return None
     return ratio_threshold * max(1.0, math.sqrt(ratio_scale / baseline))
+
+
+def shape_required_peak(
+    baseline: float, ratio_threshold: float, ratio_scale: float, floor: float
+) -> float:
+    """Absolute window peak the CPU/GPU burst rule demands at a baseline.
+
+    The multiple the peak must clear is ratio_threshold when the baseline
+    sits at half the scale - where the required peak equals the scale, i.e.
+    the peak threshold itself, so the two branches of the rule meet - and
+    grows with the cube root of the shortfall below that: roughly 5x at a
+    1% median against a 30% scale, so a workload that idles at 1% and loads
+    to 10% is caught.  Above half the scale the multiple is pinned at
+    ratio_threshold, where the peak rule subsumes this one.  `floor` is the
+    minimum required peak, and stands in for the whole curve on a zero
+    baseline: the unbounded ratio the rule once applied there fired on
+    DCGM's 1-4% idle noise tail.
+    """
+    if baseline <= 0:
+        return floor
+    half = ratio_scale / 2.0
+    multiple = ratio_threshold * max(1.0, (half / baseline) ** (1.0 / 3.0))
+    return max(floor, multiple * baseline)
 
 
 def evaluate_shape(
@@ -774,34 +798,58 @@ def evaluate_shape(
     *,
     peak_threshold: float,
     ratio_threshold: float,
-    floor: float | None = None,
+    floor: float,
     ratio_scale: float | None = None,
     node: str = "",
 ) -> ShapeStats:
     """The spike/shape rule: ACTIVE when any window exceeded `peak_threshold`,
-    or when the peak clears the baseline-scaled multiple of the baseline.
+    or when the peak clears the baseline-scaled required peak.
 
-    A zero baseline with a nonzero peak counts as an unbounded ratio.
-    `floor`, when given, additionally requires the peak to reach it before
-    the ratio branch counts; only the API spike rule passes one, to keep
-    ratios computed on absolutely quiet traffic from firing.  `ratio_scale`
-    anchors the scaled multiple (see shape_required_ratio) and defaults to
-    `peak_threshold`.
+    `ratio_scale` anchors the required peak (see shape_required_peak) and
+    defaults to `peak_threshold`.  `floor` is the minimum required peak and
+    the whole requirement on a zero baseline.
     """
     if not points:
-        return ShapeStats(0, 0.0, 0.0, None, None, False, False)
+        return ShapeStats(0, 0.0, 0.0, None, None, None, False, False)
+    peak = max(points)
+    baseline = statistics.median(points)
+    scale = peak_threshold if ratio_scale is None else ratio_scale
+    required_peak = shape_required_peak(baseline, ratio_threshold, scale, floor)
+    ratio = peak / baseline if baseline > 0 else None
+    required_ratio = required_peak / baseline if baseline > 0 else None
+    peak_exceeded = peak > peak_threshold
+    shape_exceeded = peak > required_peak
+    return ShapeStats(
+        len(points),
+        peak,
+        baseline,
+        ratio,
+        required_ratio,
+        required_peak,
+        peak_exceeded,
+        shape_exceeded,
+        node,
+    )
+
+
+def evaluate_api_spike(
+    points: list[float], *, ratio_threshold: float, floor: float, ratio_scale: float
+) -> ShapeStats:
+    """The API spike rule: the peak of the 15-minute request-rate windows
+    clearing a baseline-scaled multiple of the median window.
+
+    This stays on the sqrt scaling of shape_required_ratio (2x at the
+    request threshold, 4x at a quarter of it): the series is cluster-pooled
+    rather than per node, and `floor` - an absolute request rate the peak
+    must reach - keeps idle noise out, so the zero-baseline problem the
+    CPU/GPU rule solves with required peaks does not arise here.
+    """
     peak = max(points)
     baseline = statistics.median(points)
     ratio = peak / baseline if baseline > 0 else None
-    scale = peak_threshold if ratio_scale is None else ratio_scale
-    required = shape_required_ratio(baseline, ratio_threshold, scale)
-    peak_exceeded = peak > peak_threshold
-    shape_exceeded = (
-        peak > 0 and (floor is None or peak >= floor) and (ratio is None or ratio > required)
-    )
-    return ShapeStats(
-        len(points), peak, baseline, ratio, required, peak_exceeded, shape_exceeded, node
-    )
+    required = shape_required_ratio(baseline, ratio_threshold, ratio_scale)
+    shape_exceeded = peak > 0 and peak >= floor and (ratio is None or ratio > required)
+    return ShapeStats(len(points), peak, baseline, ratio, required, None, False, shape_exceeded)
 
 
 def evaluate_shape_by_node(
@@ -809,7 +857,7 @@ def evaluate_shape_by_node(
     *,
     peak_threshold: float,
     ratio_threshold: float,
-    floor: float | None = None,
+    floor: float,
     ratio_scale: float | None = None,
     live_nodes: set[str] | None = None,
 ) -> list[ShapeStats]:
@@ -848,23 +896,26 @@ def evaluate_shape_by_node(
     ]
 
 
-def _shape_severity(stats: ShapeStats) -> tuple[bool, float, float]:
-    """Ranking key for which node drives a summarized evaluation: unbounded
-    ratios (zero baseline, nonzero peak) first, then higher ratio, then
-    higher peak."""
-    return (stats.ratio is None and stats.peak > 0, stats.ratio or 0.0, stats.peak)
+def _shape_severity(stats: ShapeStats) -> tuple[float, float]:
+    """Ranking key for which node drives a summarized evaluation: how far
+    the peak clears that node's required peak (above 1 means the rule
+    fired), then the raw peak."""
+    required = stats.required_peak or 0.0
+    if required <= 0:
+        return (0.0, stats.peak)
+    return (stats.peak / required, stats.peak)
 
 
 def summarize_shape(per_node: list[ShapeStats]) -> ShapeStats:
     """Cluster summary over per-node evaluations.
 
     peak and peak_exceeded are pooled (any node can trip the peak rule);
-    baseline, ratio, required_ratio, and node come from the most
-    burst-shaped node, so the summary numbers describe the node that drove
-    the shape verdict.
+    baseline, ratio, required_ratio, required_peak, and node come from the
+    node that comes closest to (or furthest past) its own required peak,
+    so the summary numbers describe the node that drove the shape verdict.
     """
     if not per_node:
-        return ShapeStats(0, 0.0, 0.0, None, None, False, False)
+        return ShapeStats(0, 0.0, 0.0, None, None, None, False, False)
     driver = max(per_node, key=_shape_severity)
     return ShapeStats(
         points=sum(s.points for s in per_node),
@@ -872,6 +923,7 @@ def summarize_shape(per_node: list[ShapeStats]) -> ShapeStats:
         baseline=driver.baseline,
         ratio=driver.ratio,
         required_ratio=driver.required_ratio,
+        required_peak=driver.required_peak,
         peak_exceeded=any(s.peak_exceeded for s in per_node),
         shape_exceeded=any(s.shape_exceeded for s in per_node),
         node=driver.node,
@@ -896,6 +948,7 @@ def _shape_entry(stats: ShapeStats, per_node: list[ShapeStats] | None = None) ->
         "required_ratio": round(stats.required_ratio, 2)
         if stats.required_ratio is not None
         else None,
+        "required_peak": round(stats.required_peak, 2) if stats.required_peak is not None else None,
         "points": stats.points,
         "peak_exceeded": stats.peak_exceeded,
         "shape_exceeded": stats.shape_exceeded,
@@ -935,6 +988,7 @@ def check_cpu(
             series,
             peak_threshold=cfg.cpu_peak_threshold,
             ratio_threshold=cfg.cpu_shape_ratio,
+            floor=CPU_SHAPE_FLOOR,
             live_nodes=live_nodes,
         )
         if per_node:
@@ -1022,13 +1076,10 @@ def check_api(cfg: Config, prom: PrometheusClient) -> CheckOutcome:
         spike_points = _series_points(series)
         stats: ShapeStats | None = None
         if spike_points:
-            # Only the ratio branch applies here; the absolute-threshold
-            # branch is the windowed average checked above.  The ratio
-            # scales against the request threshold (peak_threshold is inf,
-            # so the default scale would make the rule unreachable).
-            stats = evaluate_shape(
+            # Only the spike branch applies here; the absolute-threshold
+            # branch is the windowed average checked above.
+            stats = evaluate_api_spike(
                 spike_points,
-                peak_threshold=math.inf,
                 ratio_threshold=cfg.api_spike_ratio,
                 floor=cfg.api_spike_floor,
                 ratio_scale=cfg.api_threshold,
@@ -1076,6 +1127,7 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode]) -> 
         series,
         peak_threshold=cfg.gpu_peak_threshold,
         ratio_threshold=cfg.gpu_shape_ratio,
+        floor=GPU_SHAPE_FLOOR,
     )
 
     stats: ShapeStats | None = None
@@ -1107,15 +1159,18 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode]) -> 
             peak = max(peaks)
             baseline = sum(avgs) / len(avgs) if avgs else 0.0
             ratio = peak / baseline if baseline > 0 else None
-            required = shape_required_ratio(baseline, cfg.gpu_shape_ratio, cfg.gpu_peak_threshold)
+            required_peak = shape_required_peak(
+                baseline, cfg.gpu_shape_ratio, cfg.gpu_peak_threshold, GPU_SHAPE_FLOOR
+            )
             stats = ShapeStats(
                 points=len(peaks) + len(avgs),
                 peak=peak,
                 baseline=baseline,
                 ratio=ratio,
-                required_ratio=required,
+                required_ratio=required_peak / baseline if baseline > 0 else None,
+                required_peak=required_peak,
                 peak_exceeded=peak > cfg.gpu_peak_threshold,
-                shape_exceeded=(peak > 0 and (ratio is None or ratio > required)),
+                shape_exceeded=peak > required_peak,
             )
             source = "window aggregates fallback"
         else:

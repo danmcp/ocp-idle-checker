@@ -58,14 +58,16 @@ def test_cpu_active_on_peak():
 
 def test_cpu_active_on_shape_ratio():
     # Median 5%, peak 28%: no window crossed the peak threshold, but the
-    # 5.6x peak clears the 4.9x the scaled rule requires at a median of 5.
+    # peak clears the required 14.4% (a 2.9x multiple) the cube-root curve
+    # demands at a median of 5.
     prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["5", "5", "28"])]})
     outcome = oic.check_cpu(base_config(), prom, {"node-1"}, None)
     assert outcome.result == "ACTIVE"
     assert outcome.entry["peak_exceeded"] is False
     assert outcome.entry["shape_exceeded"] is True
     assert outcome.entry["ratio"] == 5.6
-    assert outcome.entry["required_ratio"] == pytest.approx(4.9, abs=0.01)
+    assert outcome.entry["required_ratio"] == pytest.approx(2.88, abs=0.01)
+    assert outcome.entry["required_peak"] == pytest.approx(14.42, abs=0.01)
 
 
 def test_cpu_quiet_cluster_is_idle():
@@ -85,24 +87,26 @@ def test_cpu_quiet_cluster_is_idle():
     assert outcome.entry["value"] == "10.00"
 
 
-def test_cpu_small_burst_on_quiet_median_is_idle():
-    # Median 2%, peak 10%: a 5x burst, but the scaled requirement at a 2%
-    # median is 7.75x - the soft floor keeps proportionally small bursts on
-    # quiet baselines from voting ACTIVE (the no-floor behavior this
-    # replaces).
+def test_cpu_small_burst_on_quiet_median_is_active():
+    # Median 2%, peak 10%: the motivating shape - a workload that idles at
+    # 2% and loads to 10% is active.  The required peak at a 2% median is
+    # 7.8%, so the 10% peak clears it; below it (7%) stays idle.
     prom = FakeProm(
         ranges={
             oic.CPU_RANGE_QUERY: [
                 make_range_series("node-1", ["2", "2", "10"]),
-                make_range_series("node-2", ["2", "2", "8"]),
+                make_range_series("node-2", ["2", "2", "7"]),
             ]
         }
     )
     outcome = oic.check_cpu(base_config(), prom, {"node-1", "node-2"}, 2.0)
-    assert outcome.result == "IDLE"
+    assert outcome.result == "ACTIVE"
     assert outcome.entry["peak_exceeded"] is False
-    assert outcome.entry["shape_exceeded"] is False
-    assert outcome.entry["required_ratio"] == pytest.approx(7.75, abs=0.01)
+    assert outcome.entry["shape_exceeded"] is True
+    assert outcome.entry["required_peak"] == pytest.approx(7.83, abs=0.01)
+    per_node = {e["node"]: e for e in outcome.entry["per_node"]}
+    assert per_node["node-1"]["shape_exceeded"] is True
+    assert per_node["node-2"]["shape_exceeded"] is False
 
 
 def test_cpu_large_burst_on_quiet_median_is_active():
@@ -132,10 +136,11 @@ def test_cpu_steady_busy_and_quiet_nodes_are_idle():
     assert outcome.entry["shape_exceeded"] is False
     assert outcome.entry["peak"] == 19.5  # pooled max across nodes
     assert outcome.entry["value"] == "19.50"
-    # The summary reports the most burst-shaped node (the quiet one, 1.2x vs
-    # 1.15x) plus the full per-node detail.
-    assert outcome.entry["node"] == "quiet-node"
-    assert outcome.entry["ratio"] == pytest.approx(1.2)
+    # The summary reports the node closest to its own requirement - the
+    # busy one (19.5 of a pinned 2x34) vs the quiet one (2.4 of 7.8) -
+    # plus the full per-node detail.
+    assert outcome.entry["node"] == "busy-node"
+    assert outcome.entry["ratio"] == pytest.approx(1.15)  # 19.5/17, rounded as exported
     per_node = outcome.entry["per_node"]
     assert [e["node"] for e in per_node] == ["busy-node", "quiet-node"]
     assert all(e["shape_exceeded"] is False for e in per_node)
@@ -430,8 +435,20 @@ def test_gpu_active_on_shape_ratio():
     outcome = oic.check_gpu(base_config(), prom, [gpu_node()])
     assert outcome.result == "ACTIVE"
     assert outcome.entry["peak_exceeded"] is False
-    assert outcome.entry["shape_exceeded"] is True  # zero baseline, unbounded ratio
+    assert outcome.entry["shape_exceeded"] is True  # zero baseline: the floor is the requirement
     assert outcome.entry["ratio"] is None
+    assert outcome.entry["required_peak"] == pytest.approx(oic.GPU_SHAPE_FLOOR)
+
+
+def test_gpu_zero_baseline_below_the_floor_is_idle():
+    # The mmacik-sno swing vote: dense-but-zero DCGM data peaking at 3.3%
+    # all week.  The zero baseline demands the 5% floor instead of the
+    # unbounded ratio the rule once applied, so the noise tail stays idle.
+    prom = FakeProm(ranges={oic.GPU_RANGE_QUERY: [make_dcgm_series(["0", "0", "3.3"])]})
+    outcome = oic.check_gpu(base_config(), prom, [gpu_node()])
+    assert outcome.result == "IDLE"
+    assert outcome.entry["shape_exceeded"] is False
+    assert outcome.entry["required_peak"] == pytest.approx(oic.GPU_SHAPE_FLOOR)
 
 
 def test_gpu_quiet_is_idle():
@@ -492,8 +509,8 @@ def test_gpu_deleted_node_samples_still_vote():
 
 def test_gpu_aggregate_fallback():
     # No query_range matrix: whole-window max/avg aggregates decide.  Peak
-    # 30 over a 4% average is 7.5x, clearing the 6.32x the scaled rule
-    # requires at that baseline.
+    # 30 over a 4% average clears the required 13.7% the cube-root curve
+    # demands at that baseline.
     prom = FakeProm(
         instant_all={
             gpu_max_query(WINDOW): [
@@ -512,7 +529,8 @@ def test_gpu_aggregate_fallback():
     assert outcome.entry["peak"] == 30.0
     assert outcome.entry["baseline"] == 4.0  # mean of the per-series averages
     assert outcome.entry["ratio"] == 7.5  # 30/4, rounded as exported
-    assert outcome.entry["required_ratio"] == pytest.approx(6.32, abs=0.01)
+    assert outcome.entry["required_ratio"] == pytest.approx(3.42, abs=0.01)
+    assert outcome.entry["required_peak"] == pytest.approx(13.68, abs=0.01)
 
 
 def test_gpu_aggregate_fallback_quiet():

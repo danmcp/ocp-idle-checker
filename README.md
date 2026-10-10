@@ -31,10 +31,10 @@ Each criterion is evaluated independently and can be `IDLE`, `ACTIVE`, `UNKNOWN`
 
 | Criterion | Votes ACTIVE when |
 |-----------|-------------------|
-| **CPU** | any node's 15-minute window > 30%, or any node's window peak clearing a baseline-scaled multiple of its own median window (2× at a 30% median, steeper on quieter medians); an instant `oc adm top nodes` reading ≥ 15% can also flip an otherwise-IDLE result |
+| **CPU** | any node's 15-minute window > 30%, or any node's window peak clearing a baseline-scaled required peak (≈5× its own median at a 1% median, 2× at 15%); an instant `oc adm top nodes` reading ≥ 15% can also flip an otherwise-IDLE result |
 | **Memory** | the time-windowed average ≥ 35%, or an instant snapshot ≥ 35% (one-directional override) |
 | **API Server** | the time-windowed average ≥ 100 req/sec, or any 15-minute window clearing a baseline-scaled multiple of the median window (2× at a 100 req/s median, steeper on quieter medians) while above 50 req/s |
-| **GPU** | any node's 15-minute window > 40%, or any node's window peak clearing a baseline-scaled multiple of its own median window (DCGM GPU utilization) |
+| **GPU** | any node's 15-minute window > 40%, or any node's window peak clearing a baseline-scaled required peak (DCGM GPU utilization) |
 | **Operators** | the median controller age is < 7 days, or ≥ 5 reconciliation events in the last 48 hours |
 
 A criterion votes IDLE when none of its ACTIVE conditions hold. Some criteria can instead be N/A — not counted in the denominator (see [Conditional Criteria](#conditional-criteria)).
@@ -44,19 +44,23 @@ A criterion votes IDLE when none of its ACTIVE conditions hold. Some criteria ca
 The CPU and GPU criteria take per-node 15-minute window averages from the Prometheus `query_range` matrix and evaluate **each node against its own history**: a steady busy node pooled with a quiet sibling is two steady nodes, not a burst, so pooling the cluster's windows into one median (the old behavior) is gone. The criterion votes ACTIVE when any node is individually bursty:
 
 - **Peak rule**: any node's 15-minute window averaged above the peak threshold (30% for CPU, 40% for GPU), **or**
-- **Shape rule**: a node's window peak clears a **baseline-scaled multiple** of that node's own median window.
+- **Shape rule**: a node's window peak clears a **required peak** derived from that node's own median window.
 
-The required multiple is `shape-ratio` (default 2×) when the node's median sits at the peak threshold, and grows with the square root of the shortfall as the median drops — a soft floor in place of the absolute one this rule once had:
+The required peak is anchored at the peak threshold: at half of it (a 15% CPU median) the requirement is exactly the threshold — 2× the median, where the two branches of the rule meet — and it falls with the cube root of the median below that, so a workload that idles at 1% and loads to 10% is caught while a steady node sitting near its own median never fires:
 
-| node median | required multiple | peak needed |
-|---|---|---|
-| at the peak threshold (30% CPU / 40% GPU) | 2× | 60% / 80% |
-| a quarter of it (7.5% / 10%) | 4× | 30% / 40% |
-| a sixteenth of it | 8× | 15% / 20% |
+| node median | required multiple (CPU / GPU) | required peak (CPU, threshold 30) | required peak (GPU, threshold 40) |
+|---|---|---|---|
+| 0% | — (floor) | 1% | 5% |
+| 1% | 4.9× / 5.4× | 4.9% | 5.4% |
+| 2% | 3.9× / 4.3× | 7.8% | 8.6% |
+| 5% | 2.9× / 3.2× | 14.4% | 15.9% |
+| 10% | 2.3× / 2.5× | 22.9% | 25.2% |
+| half the threshold (15% / 20%) | 2× | 30% | 40% |
+| above half | 2× (pinned) | 2× the median — the peak rule fires first | ditto |
 
-So a quiet baseline needs a proportionally bigger burst before the shape rule fires: a 2% median with a 10% peak is a 5× variation but stays IDLE, while a 20% peak (10×) counts as bursty. The multiple never drops below `shape-ratio` above the threshold. Below a quarter of the threshold the shape rule is the sensitive branch; at or above it the peak threshold takes over. A zero baseline with a nonzero peak still counts as an unbounded ratio and trips the shape rule, per node. Fleet calibration put the CPU peak threshold at 30%: the 30-40% max-peak band is sustained workloads the shape rule cannot see (a steady node sits near its own median), idle exemplars peak below 20%, and the highest one-off blip below 40% sits at 26.9%.
+The multiple is `shape-ratio` (default 2×) at half the threshold and above it; below, the shape rule is the sensitive branch, since above half it cannot fire before the peak rule does. A zero or near-zero baseline requires an absolute floor instead of a ratio — 1% for CPU, 5% for GPU — replacing the unbounded ratio the rule once applied there, which fired on DCGM's 1-4% idle noise tail (kernel-residency blips from context init, ECC scrubbing, and health probes, not real use). Fleet calibration put the CPU peak threshold at 30%: the 30-40% max-peak band is sustained workloads the shape rule cannot see (a steady node sits near its own median), idle exemplars peak below 20%, and the highest one-off blip below 40% sits at 26.9%.
 
-The criteria JSON detail exports each node's peak, median, ratio, and required multiple (`per_node`), with the cluster-level summary reporting the pooled peak plus the baseline/ratio of the most burst-shaped node (`node`, `required_ratio`).
+The criteria JSON detail exports each node's peak, median, ratio, required multiple, and required peak (`per_node`), with the cluster-level summary reporting the pooled peak plus the baseline/ratio of the node that came closest to (or furthest past) its own requirement (`node`, `required_ratio`, `required_peak`).
 
 CPU falls back to the legacy window-average rule when the range matrix is unavailable, and an instant `oc adm top nodes` reading above the idle threshold can still override an IDLE result (one-directional, as in the bash version). The GPU rule deliberately keeps series from deleted GPU nodes — their samples are still activity — and falls back to whole-window max/avg aggregates when the matrix is unavailable.
 
@@ -107,9 +111,9 @@ CPU and memory `UNKNOWN` still count toward the denominator (they never help the
 | `--operator-exclude-prefixes PREFIX,...` | Namespace prefixes excluded from the operator scan | openshift-,kube-,open-cluster-management- |
 | `--operator-event-hours HOURS` | Reconciliation event window for the operators criterion | 48 |
 | `--cpu-peak-threshold N` | CPU: any 15-min window above this % = ACTIVE | 30 |
-| `--cpu-shape-ratio N` | CPU: burst multiplier the peak must clear when a node median is at the peak threshold; quieter medians require more | 2 |
+| `--cpu-shape-ratio N` | CPU: burst multiple the peak must clear when a node median is at half the peak threshold; quieter medians require more | 2 |
 | `--gpu-peak-threshold N` | GPU: any 15-min window above this % = ACTIVE | 40 |
-| `--gpu-shape-ratio N` | GPU: burst multiplier the peak must clear when a node median is at the peak threshold; quieter medians require more | 2 |
+| `--gpu-shape-ratio N` | GPU: burst multiple the peak must clear when a node median is at half the peak threshold; quieter medians require more | 2 |
 | `--api-spike-ratio N` | API: burst multiplier the peak must clear when the median window is at the request threshold; quieter medians require more | 2 |
 | `--api-spike-floor N` | API: peak must reach this many req/s for the ratio to count | 50 |
 | `--csv FILE` | Export to CSV | - |
@@ -157,13 +161,14 @@ timestamp,cluster,status,cpu_result,cpu_value,memory_result,...,gpu_result,gpu_v
   "criteria": {
     "cpu": {
       "result": "IDLE",
-      "peak": 12.0,
+      "peak": 9.0,
       "baseline": 3.0,
-      "ratio": 4.0,
-      "required_ratio": 7.3,
+      "ratio": 3.0,
+      "required_ratio": 3.42,
+      "required_peak": 10.26,
       "node": "node-1",
       "per_node": [
-        {"node": "node-1", "peak": 12.0, "baseline": 3.0, "ratio": 4.0, "required_ratio": 7.3, "points": 673, "peak_exceeded": false, "shape_exceeded": false}
+        {"node": "node-1", "peak": 9.0, "baseline": 3.0, "ratio": 3.0, "required_ratio": 3.42, "required_peak": 10.26, "points": 673, "peak_exceeded": false, "shape_exceeded": false}
       ]
     },
     "gpu": { "result": "ACTIVE", "peak": 80.0 },
