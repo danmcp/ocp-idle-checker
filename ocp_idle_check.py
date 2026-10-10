@@ -9,22 +9,27 @@ README examples - keep working unchanged.
 A cluster is IDLE when at least 80% of the applicable criteria vote IDLE:
 
   cpu        spike/shape rule on per-node 15-minute CPU averages taken from
-             the Prometheus query_range matrix: ACTIVE when any 15-minute
-             window averaged above the peak threshold, or when the window
-             peak is more than shape-ratio times the median window.  Falls
-             back to the legacy window-average rule when the matrix is
-             unavailable.  An instant
-             reading above the idle threshold can still override an IDLE
-             result (one-directional, as in the bash version).
+             the Prometheus query_range matrix, evaluated per node - each
+             node's windows against that node's own median, so a steady busy
+             node pooled with a quiet sibling is two steady nodes, not a
+             burst: ACTIVE when any node's window averaged above the peak
+             threshold, or when a node's window peak clears a
+             baseline-scaled multiple of that node's median (shape-ratio at
+             a baseline of the peak threshold, growing as the baseline
+             drops).  Falls back to the legacy window-average rule when the
+             matrix is unavailable.  An instant reading above the idle
+             threshold can still override an IDLE result (one-directional,
+             as in the bash version).
   memory     legacy window-average rule with the same one-directional
              instant override.
   api_server legacy window-average request rate against the threshold, plus
-             a spike detector: any 15-minute window above spike-ratio times
-             the median window (and above an absolute floor) also counts as
+             a spike detector: any 15-minute window above a baseline-scaled
+             multiple of the median window (spike-ratio at a baseline of the
+             request threshold, and above an absolute floor) also counts as
              ACTIVE.
-  gpu        the same spike/shape rule as cpu, on DCGM GPU utilization
-             (DCGM_FI_DEV_GPU_UTIL).  N/A (not counted) on clusters without
-             GPU nodes or without DCGM metrics.
+  gpu        the same per-node spike/shape rule as cpu, on DCGM GPU
+             utilization (DCGM_FI_DEV_GPU_UTIL).  N/A (not counted) on
+             clusters without GPU nodes or without DCGM metrics.
   operators  controller age and reconciliation events across all non-platform
              namespaces: ACTIVE when the median controller is younger than
              the age threshold (controllers are aged by their ReplicaSet,
@@ -35,7 +40,12 @@ A cluster is IDLE when at least 80% of the applicable criteria vote IDLE:
 
 The spike/shape parameters (peak threshold, ratio; the API spike rule also
 has an absolute floor) are fleet calibration knobs exposed as command-line
-flags; the defaults are provisional.  "Baseline" is the median of the
+flags; the defaults are provisional.  The ratio requirement scales with the
+baseline: shape-ratio at a baseline of the criterion's normal threshold
+(peak threshold for CPU/GPU, request threshold for API), growing with the
+square root of the shortfall so quiet baselines need proportionally bigger
+bursts before they count as bursty - the soft floor that replaces the
+absolute one the rule once had.  "Baseline" is the median of the
 15-minute windows on the query_range path and the window mean on the
 aggregate fallback path.
 
@@ -99,10 +109,10 @@ ML_NODE_PATTERN = "p5|p4d|g5"
 
 # Spike/shape rule defaults - fleet-calibration knobs, ideal values TBD.
 CPU_PEAK_THRESHOLD = 40.0  # percent; any 15-min window above this = ACTIVE
-CPU_SHAPE_RATIO = 2.0  # peak / baseline above this = ACTIVE
+CPU_SHAPE_RATIO = 2.0  # burst multiplier required at a peak-threshold baseline
 GPU_PEAK_THRESHOLD = 40.0
-GPU_SHAPE_RATIO = 2.0
-API_SPIKE_RATIO = 2.0  # peak / baseline above this = ACTIVE
+GPU_SHAPE_RATIO = 2.0  # burst multiplier required at a peak-threshold baseline
+API_SPIKE_RATIO = 2.0  # burst multiplier required at a request-threshold baseline
 API_SPIKE_FLOOR = 50.0  # requests/sec; peak must reach this for the ratio to count
 
 SPIKE_WINDOW_MINUTES = 15  # the "15 min period" of the spike/shape rule
@@ -322,7 +332,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         type=float,
         default=CPU_SHAPE_RATIO,
         metavar="N",
-        help="CPU spike rule: peak/baseline above this = ACTIVE (default: %(default)s)",
+        help="CPU spike rule: burst multiplier the peak must clear when a node median is at the peak threshold; quieter medians require more (default: %(default)s)",
     )
     parser.add_argument(
         "--gpu-peak-threshold",
@@ -336,14 +346,14 @@ def parse_args(argv: list[str] | None = None) -> Config:
         type=float,
         default=GPU_SHAPE_RATIO,
         metavar="N",
-        help="GPU spike rule: peak/baseline above this = ACTIVE (default: %(default)s)",
+        help="GPU spike rule: burst multiplier the peak must clear when a node median is at the peak threshold; quieter medians require more (default: %(default)s)",
     )
     parser.add_argument(
         "--api-spike-ratio",
         type=float,
         default=API_SPIKE_RATIO,
         metavar="N",
-        help="API spike rule: peak/baseline above this = ACTIVE (default: %(default)s)",
+        help="API spike rule: burst multiplier the peak must clear when the median window is at the request threshold; quieter medians require more (default: %(default)s)",
     )
     parser.add_argument(
         "--api-spike-floor",
@@ -726,12 +736,37 @@ class ShapeStats:
     peak: float
     baseline: float  # median of windows (query_range) or window mean (fallback)
     ratio: float | None  # peak / baseline; None when the baseline is zero
+    required_ratio: float | None  # scaled multiple the peak must clear; None = unbounded
     peak_exceeded: bool
     shape_exceeded: bool
+    node: str = ""  # set by per-node evaluation; empty when not node-scoped
 
     @property
     def active(self) -> bool:
         return self.peak_exceeded or self.shape_exceeded
+
+
+def shape_required_ratio(
+    baseline: float, ratio_threshold: float, ratio_scale: float
+) -> float | None:
+    """Baseline-scaled burst multiplier the shape rule demands.
+
+    The peak must clear ratio_threshold times the baseline when the baseline
+    sits at ratio_scale - the criterion's normal threshold (peak threshold
+    for CPU/GPU, request-rate threshold for the API spike rule).  A quieter
+    baseline demands a larger multiple, growing with the square root of the
+    shortfall: 2x at the scale, 4x at a quarter of it, 8x at a sixteenth.
+    Above the scale the multiple is pinned at ratio_threshold, never lower.
+    This is the soft floor that replaces the absolute one the rule once
+    had: quiet baselines need proportionally bigger bursts before they
+    count as bursty, without a hard cutoff.
+
+    A zero baseline is an unbounded ratio (None); the caller fires on any
+    nonzero peak, as before.
+    """
+    if baseline <= 0:
+        return None
+    return ratio_threshold * max(1.0, math.sqrt(ratio_scale / baseline))
 
 
 def evaluate_shape(
@@ -740,25 +775,107 @@ def evaluate_shape(
     peak_threshold: float,
     ratio_threshold: float,
     floor: float | None = None,
+    ratio_scale: float | None = None,
+    node: str = "",
 ) -> ShapeStats:
     """The spike/shape rule: ACTIVE when any window exceeded `peak_threshold`,
-    or when the peak is `ratio_threshold` times the baseline.
+    or when the peak clears the baseline-scaled multiple of the baseline.
 
     A zero baseline with a nonzero peak counts as an unbounded ratio.
     `floor`, when given, additionally requires the peak to reach it before
     the ratio branch counts; only the API spike rule passes one, to keep
-    ratios computed on absolutely quiet traffic from firing.
+    ratios computed on absolutely quiet traffic from firing.  `ratio_scale`
+    anchors the scaled multiple (see shape_required_ratio) and defaults to
+    `peak_threshold`.
     """
     if not points:
-        return ShapeStats(0, 0.0, 0.0, None, False, False)
+        return ShapeStats(0, 0.0, 0.0, None, None, False, False)
     peak = max(points)
     baseline = statistics.median(points)
     ratio = peak / baseline if baseline > 0 else None
+    scale = peak_threshold if ratio_scale is None else ratio_scale
+    required = shape_required_ratio(baseline, ratio_threshold, scale)
     peak_exceeded = peak > peak_threshold
     shape_exceeded = (
-        peak > 0 and (floor is None or peak >= floor) and (ratio is None or ratio > ratio_threshold)
+        peak > 0 and (floor is None or peak >= floor) and (ratio is None or ratio > required)
     )
-    return ShapeStats(len(points), peak, baseline, ratio, peak_exceeded, shape_exceeded)
+    return ShapeStats(
+        len(points), peak, baseline, ratio, required, peak_exceeded, shape_exceeded, node
+    )
+
+
+def evaluate_shape_by_node(
+    series: list[dict[str, Any]] | None,
+    *,
+    peak_threshold: float,
+    ratio_threshold: float,
+    floor: float | None = None,
+    ratio_scale: float | None = None,
+    live_nodes: set[str] | None = None,
+) -> list[ShapeStats]:
+    """Evaluate the shape rule once per node, each against its own median.
+
+    Grouping matters because a pooled median is dragged by cross-node
+    heterogeneity: a steady busy node pooled with a steady quiet sibling
+    lands the median in the valley between the two modes, and the busy
+    node's peak over that valley reads as a burst.  Judged per node, both
+    are steady.  `live_nodes`, when given, drops series from nodes that no
+    longer exist (their history is real but says nothing about the cluster
+    as it stands); the GPU criterion deliberately omits it, since a deleted
+    node's samples are still activity.  Series with neither a `node` nor an
+    `instance` label share the empty node name and pool as one group.
+    Returns stats sorted by node name for deterministic output.
+    """
+    if not series:
+        return []
+    grouped: dict[str, list[float]] = {}
+    for s in series:
+        node = _series_node(s.get("metric", {}))
+        if live_nodes is not None and node not in live_nodes:
+            continue
+        grouped.setdefault(node, []).extend(_to_floats([v for _, v in s.get("values", [])]))
+    return [
+        evaluate_shape(
+            points,
+            peak_threshold=peak_threshold,
+            ratio_threshold=ratio_threshold,
+            floor=floor,
+            ratio_scale=ratio_scale,
+            node=node,
+        )
+        for node, points in sorted(grouped.items())
+        if points
+    ]
+
+
+def _shape_severity(stats: ShapeStats) -> tuple[bool, float, float]:
+    """Ranking key for which node drives a summarized evaluation: unbounded
+    ratios (zero baseline, nonzero peak) first, then higher ratio, then
+    higher peak."""
+    return (stats.ratio is None and stats.peak > 0, stats.ratio or 0.0, stats.peak)
+
+
+def summarize_shape(per_node: list[ShapeStats]) -> ShapeStats:
+    """Cluster summary over per-node evaluations.
+
+    peak and peak_exceeded are pooled (any node can trip the peak rule);
+    baseline, ratio, required_ratio, and node come from the most
+    burst-shaped node, so the summary numbers describe the node that drove
+    the shape verdict.
+    """
+    if not per_node:
+        return ShapeStats(0, 0.0, 0.0, None, None, False, False)
+    driver = max(per_node, key=_shape_severity)
+    return ShapeStats(
+        points=sum(s.points for s in per_node),
+        peak=max(s.peak for s in per_node),
+        baseline=driver.baseline,
+        ratio=driver.ratio,
+        required_ratio=driver.required_ratio,
+        peak_exceeded=any(s.peak_exceeded for s in per_node),
+        shape_exceeded=any(s.shape_exceeded for s in per_node),
+        node=driver.node,
+    )
 
 
 @dataclass(frozen=True)
@@ -770,16 +887,24 @@ class CheckOutcome:
     counted: bool  # counts toward the 80% denominator
 
 
-def _shape_entry(stats: ShapeStats) -> dict[str, Any]:
+def _shape_entry(stats: ShapeStats, per_node: list[ShapeStats] | None = None) -> dict[str, Any]:
     """JSON detail for a spike/shape evaluation (additive to result/value)."""
-    return {
+    entry: dict[str, Any] = {
         "peak": round(stats.peak, 2),
         "baseline": round(stats.baseline, 2),
         "ratio": round(stats.ratio, 2) if stats.ratio is not None else None,
+        "required_ratio": round(stats.required_ratio, 2)
+        if stats.required_ratio is not None
+        else None,
         "points": stats.points,
         "peak_exceeded": stats.peak_exceeded,
         "shape_exceeded": stats.shape_exceeded,
     }
+    if stats.node:
+        entry["node"] = stats.node
+    if per_node:
+        entry["per_node"] = [_shape_entry(s) for s in per_node]
+    return entry
 
 
 # === CRITERIA ==============================================================
@@ -796,25 +921,24 @@ def check_cpu(
     entry: dict[str, Any] = {"result": "UNKNOWN", "value": None}
     stats: ShapeStats | None = None
     windowed: float | None = None
+    per_node: list[ShapeStats] = []
 
     if cfg.time_window_minutes > 0:
         end_s = int(time.time())
         start_s = end_s - cfg.time_window_minutes * 60
         series = prom.query_range(CPU_RANGE_QUERY, start_s, end_s)
-        # Only nodes that still exist count: series from deleted nodes are
-        # real history but say nothing about the cluster as it stands.
-        points = [
-            value
-            for s in series or []
-            if _series_node(s.get("metric", {})) in live_nodes
-            for value in _to_floats([v for _, v in s.get("values", [])])
-        ]
-        if points:
-            stats = evaluate_shape(
-                points,
-                peak_threshold=cfg.cpu_peak_threshold,
-                ratio_threshold=cfg.cpu_shape_ratio,
-            )
+        # Each node's windows are judged against that node's own median,
+        # with series from deleted nodes dropped: their history is real but
+        # says nothing about the cluster as it stands, and a steady busy
+        # node pooled with a quiet sibling is two steady nodes, not a burst.
+        per_node = evaluate_shape_by_node(
+            series,
+            peak_threshold=cfg.cpu_peak_threshold,
+            ratio_threshold=cfg.cpu_shape_ratio,
+            live_nodes=live_nodes,
+        )
+        if per_node:
+            stats = summarize_shape(per_node)
         else:
             log_info("CPU query_range matrix unavailable; using legacy window average")
             windowed = prom.query(
@@ -827,7 +951,7 @@ def check_cpu(
     if stats is not None:
         active = stats.active
         source = f"spike/shape over {SPIKE_WINDOW_MINUTES}m windows"
-        entry.update(_shape_entry(stats))
+        entry.update(_shape_entry(stats, per_node))
     elif windowed is not None:
         active = windowed >= cfg.cpu_idle_threshold
         source = "legacy window average"
@@ -899,12 +1023,15 @@ def check_api(cfg: Config, prom: PrometheusClient) -> CheckOutcome:
         stats: ShapeStats | None = None
         if spike_points:
             # Only the ratio branch applies here; the absolute-threshold
-            # branch is the windowed average checked above.
+            # branch is the windowed average checked above.  The ratio
+            # scales against the request threshold (peak_threshold is inf,
+            # so the default scale would make the rule unreachable).
             stats = evaluate_shape(
                 spike_points,
                 peak_threshold=math.inf,
                 ratio_threshold=cfg.api_spike_ratio,
                 floor=cfg.api_spike_floor,
+                ratio_scale=cfg.api_threshold,
             )
     else:
         avg = prom.query("sum(rate(apiserver_request_total[5m]))")
@@ -922,6 +1049,9 @@ def check_api(cfg: Config, prom: PrometheusClient) -> CheckOutcome:
         entry["spike_peak"] = round(stats.peak, 2)
         entry["spike_baseline"] = round(stats.baseline, 2)
         entry["spike_ratio"] = round(stats.ratio, 2) if stats.ratio is not None else None
+        entry["spike_required_ratio"] = (
+            round(stats.required_ratio, 2) if stats.required_ratio is not None else None
+        )
         entry["spike_active"] = stats.shape_exceeded
     return CheckOutcome(entry["result"], entry, counted=True)
 
@@ -940,16 +1070,18 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode]) -> 
     end_s = int(time.time())
     start_s = end_s - cfg.time_window_minutes * 60
     series = prom.query_range(GPU_RANGE_QUERY, start_s, end_s)
-    points = _series_points(series)
+    # Grouped per node (per exporter) but with no live filter, unlike cpu:
+    # a deleted node's DCGM samples are still activity.
+    per_node = evaluate_shape_by_node(
+        series,
+        peak_threshold=cfg.gpu_peak_threshold,
+        ratio_threshold=cfg.gpu_shape_ratio,
+    )
 
     stats: ShapeStats | None = None
     source = f"spike/shape over {SPIKE_WINDOW_MINUTES}m windows"
-    if points:
-        stats = evaluate_shape(
-            points,
-            peak_threshold=cfg.gpu_peak_threshold,
-            ratio_threshold=cfg.gpu_shape_ratio,
-        )
+    if per_node:
+        stats = summarize_shape(per_node)
     else:
         # Aggregate fallback: whole-window max/avg per series.  All exporter
         # series are pooled - a deleted node's samples are still activity.
@@ -975,13 +1107,15 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode]) -> 
             peak = max(peaks)
             baseline = sum(avgs) / len(avgs) if avgs else 0.0
             ratio = peak / baseline if baseline > 0 else None
+            required = shape_required_ratio(baseline, cfg.gpu_shape_ratio, cfg.gpu_peak_threshold)
             stats = ShapeStats(
                 points=len(peaks) + len(avgs),
                 peak=peak,
                 baseline=baseline,
                 ratio=ratio,
+                required_ratio=required,
                 peak_exceeded=peak > cfg.gpu_peak_threshold,
-                shape_exceeded=(peak > 0 and (ratio is None or ratio > cfg.gpu_shape_ratio)),
+                shape_exceeded=(peak > 0 and (ratio is None or ratio > required)),
             )
             source = "window aggregates fallback"
         else:
@@ -990,7 +1124,7 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode]) -> 
 
     entry["result"] = "ACTIVE" if stats.active else "IDLE"
     entry["value"] = fmt2(stats.peak)
-    entry.update(_shape_entry(stats))
+    entry.update(_shape_entry(stats, per_node))
     entry["source"] = source
     return CheckOutcome(entry["result"], entry, counted=True)
 

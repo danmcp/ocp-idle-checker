@@ -49,10 +49,15 @@ def make_range_series(node: str, values: list[str]) -> dict:
     }
 
 
-def make_dcgm_series(values: list[str], gpu: str = "0") -> dict:
-    """One query_range result series for a DCGM utilization gauge."""
+def make_dcgm_series(values: list[str], gpu: str = "0", instance: str = "gpu-node:9400") -> dict:
+    """One query_range result series for a DCGM utilization gauge.
+
+    Real DCGM series carry an exporter `instance` label (host:port) and no
+    `node` label, so per-node grouping keys on it; cards on the same node
+    share the instance and pool into one node's windows.
+    """
     return {
-        "metric": {"gpu": gpu, "Hostname": "gpu-node"},
+        "metric": {"gpu": gpu, "Hostname": "gpu-node", "instance": instance},
         "values": [[1700000000 + i * 900, v] for i, v in enumerate(values)],
     }
 

@@ -31,28 +31,39 @@ Each criterion is evaluated independently and can be `IDLE`, `ACTIVE`, `UNKNOWN`
 
 | Criterion | Votes ACTIVE when |
 |-----------|-------------------|
-| **CPU** | any 15-minute window > 40%, or the window peak > 2× the median window; an instant `oc adm top nodes` reading ≥ 15% can also flip an otherwise-IDLE result |
+| **CPU** | any node's 15-minute window > 40%, or any node's window peak clearing a baseline-scaled multiple of its own median window (2× at a 40% median, steeper on quieter medians); an instant `oc adm top nodes` reading ≥ 15% can also flip an otherwise-IDLE result |
 | **Memory** | the time-windowed average ≥ 35%, or an instant snapshot ≥ 35% (one-directional override) |
-| **API Server** | the time-windowed average ≥ 100 req/sec, or any 15-minute window > 2× the median window while above 50 req/s |
-| **GPU** | any 15-minute window > 40%, or the window peak > 2× the median window (DCGM GPU utilization) |
+| **API Server** | the time-windowed average ≥ 100 req/sec, or any 15-minute window clearing a baseline-scaled multiple of the median window (2× at a 100 req/s median, steeper on quieter medians) while above 50 req/s |
+| **GPU** | any node's 15-minute window > 40%, or any node's window peak clearing a baseline-scaled multiple of its own median window (DCGM GPU utilization) |
 | **Operators** | the median controller age is < 7 days, or ≥ 5 reconciliation events in the last 48 hours |
 
 A criterion votes IDLE when none of its ACTIVE conditions hold. Some criteria can instead be N/A — not counted in the denominator (see [Conditional Criteria](#conditional-criteria)).
 
 ### Spike/Shape Detection (CPU & GPU)
 
-The CPU and GPU criteria pool per-node 15-minute window averages from the Prometheus `query_range` matrix and evaluate:
+The CPU and GPU criteria take per-node 15-minute window averages from the Prometheus `query_range` matrix and evaluate **each node against its own history**: a steady busy node pooled with a quiet sibling is two steady nodes, not a burst, so pooling the cluster's windows into one median (the old behavior) is gone. The criterion votes ACTIVE when any node is individually bursty:
 
-- **Peak rule**: any 15-minute window averaged above the peak threshold (default 40%), **or**
-- **Shape rule**: the window peak is more than shape-ratio times (default 2×) the median window.
+- **Peak rule**: any node's 15-minute window averaged above the peak threshold (default 40%), **or**
+- **Shape rule**: a node's window peak clears a **baseline-scaled multiple** of that node's own median window.
 
-A zero baseline with a nonzero peak counts as an unbounded ratio and trips the shape rule. There is deliberately no absolute floor on the ratio: a cluster whose median window is 2% and whose peak window is 10% is a 5× variation and counts as bursty.
+The required multiple is `shape-ratio` (default 2×) when the node's median sits at the peak threshold, and grows with the square root of the shortfall as the median drops — a soft floor in place of the absolute one this rule once had:
 
-CPU falls back to the legacy window-average rule when the range matrix is unavailable, and an instant `oc adm top nodes` reading above the idle threshold can still override an IDLE result (one-directional, as in the bash version).
+| node median (CPU/GPU) | required multiple | peak needed |
+|---|---|---|
+| 40% (threshold) | 2× | 80% |
+| 10% (quarter) | 4× | 40% |
+| 2.5% | 8× | 20% |
+| 1% | 12.6× | 12.6% |
+
+So a quiet baseline needs a proportionally bigger burst before the shape rule fires: a 2% median with a 10% peak is a 5× variation but stays IDLE, while a 20% peak (10×) counts as bursty. The multiple never drops below `shape-ratio` above the threshold. Below a quarter of the threshold the shape rule is the sensitive branch; at or above it the peak threshold takes over. A zero baseline with a nonzero peak still counts as an unbounded ratio and trips the shape rule, per node.
+
+The criteria JSON detail exports each node's peak, median, ratio, and required multiple (`per_node`), with the cluster-level summary reporting the pooled peak plus the baseline/ratio of the most burst-shaped node (`node`, `required_ratio`).
+
+CPU falls back to the legacy window-average rule when the range matrix is unavailable, and an instant `oc adm top nodes` reading above the idle threshold can still override an IDLE result (one-directional, as in the bash version). The GPU rule deliberately keeps series from deleted GPU nodes — their samples are still activity — and falls back to whole-window max/avg aggregates when the matrix is unavailable.
 
 ### Spike Detection (API Server)
 
-The API server criterion keeps the legacy window-average threshold (100 req/sec) and adds a second detector: any 15-minute window above 2× the median window (and above a floor of 50 req/s) also counts as ACTIVE.
+The API server criterion keeps the legacy window-average threshold (100 req/sec) and adds a second detector: any 15-minute window clearing a baseline-scaled multiple of the median window also counts as ACTIVE. The same scaling applies, with the request-rate threshold (100 req/s) as the reference point — 2× at a 100 req/s median, 4× at 25 req/s, steeper below — in addition to the absolute floor of 50 req/s the peak must reach.
 
 ### Operators
 
@@ -97,10 +108,10 @@ CPU and memory `UNKNOWN` still count toward the denominator (they never help the
 | `--operator-exclude-prefixes PREFIX,...` | Namespace prefixes excluded from the operator scan | openshift-,kube-,open-cluster-management- |
 | `--operator-event-hours HOURS` | Reconciliation event window for the operators criterion | 48 |
 | `--cpu-peak-threshold N` | CPU: any 15-min window above this % = ACTIVE | 40 |
-| `--cpu-shape-ratio N` | CPU: peak/median above this = ACTIVE | 2 |
+| `--cpu-shape-ratio N` | CPU: burst multiplier the peak must clear when a node median is at the peak threshold; quieter medians require more | 2 |
 | `--gpu-peak-threshold N` | GPU: any 15-min window above this % = ACTIVE | 40 |
-| `--gpu-shape-ratio N` | GPU: peak/median above this = ACTIVE | 2 |
-| `--api-spike-ratio N` | API: peak/median above this = ACTIVE | 2 |
+| `--gpu-shape-ratio N` | GPU: burst multiplier the peak must clear when a node median is at the peak threshold; quieter medians require more | 2 |
+| `--api-spike-ratio N` | API: burst multiplier the peak must clear when the median window is at the request threshold; quieter medians require more | 2 |
 | `--api-spike-floor N` | API: peak must reach this many req/s for the ratio to count | 50 |
 | `--csv FILE` | Export to CSV | - |
 | `--json FILE` | Export to JSON | - |
@@ -145,7 +156,17 @@ timestamp,cluster,status,cpu_result,cpu_value,memory_result,...,gpu_result,gpu_v
 {
   "status": "IDLE",
   "criteria": {
-    "cpu": { "result": "IDLE", "peak": 12.0, "baseline": 3.0, "ratio": 4.0 },
+    "cpu": {
+      "result": "IDLE",
+      "peak": 12.0,
+      "baseline": 3.0,
+      "ratio": 4.0,
+      "required_ratio": 7.3,
+      "node": "node-1",
+      "per_node": [
+        {"node": "node-1", "peak": 12.0, "baseline": 3.0, "ratio": 4.0, "required_ratio": 7.3, "points": 673, "peak_exceeded": false, "shape_exceeded": false}
+      ]
+    },
     "gpu": { "result": "ACTIVE", "peak": 80.0 },
     ...
   },
