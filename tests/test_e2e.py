@@ -118,13 +118,17 @@ def install_fake_oc(
     return calls
 
 
-def node_item(name: str, instance_type: str = "m5.xlarge", gpus: str | None = None) -> dict:
+def node_item(
+    name: str,
+    instance_type: str = "m5.xlarge",
+    gpus: str | None = None,
+    roles: list[str] | None = None,
+) -> dict:
     capacity = {"nvidia.com/gpu": gpus} if gpus is not None else {}
+    labels = {"node.kubernetes.io/instance-type": instance_type}
+    labels.update({role: "" for role in roles or []})
     return {
-        "metadata": {
-            "name": name,
-            "labels": {"node.kubernetes.io/instance-type": instance_type},
-        },
+        "metadata": {"name": name, "labels": labels},
         "status": {"capacity": capacity},
     }
 
@@ -205,6 +209,7 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
         "configuration",
         "criteria",
         "gpu",
+        "oversized",
     ]
     assert list(report["configuration"]) == [
         "time_window_minutes",
@@ -252,6 +257,8 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
     assert set(criteria["operators"]) == {"result", "age_days", "events", "threshold_ratio"}
     # The token came from `oc whoami -t`; no service-account token was created.
     assert CREATE_TOKEN_ARGS not in calls
+    # An IDLE cluster is not oversized, whatever its node levels.
+    assert report["oversized"] == {"result": False, "gpu_peak": None, "nodes": []}
 
 
 def test_active_cluster_quiet(monkeypatch, prom_server, tmp_path, capsys):
@@ -278,10 +285,15 @@ def test_active_cluster_quiet(monkeypatch, prom_server, tmp_path, capsys):
     json_path = tmp_path / "report.json"
     exit_code = oic.run(["-q", "--json", str(json_path), "-w", str(WINDOW)])
     assert exit_code == 0
-    assert (
-        capsys.readouterr().out.splitlines()[-1]
-        == "STATUS: ACTIVE (Operators at 350% of threshold)"
-    )
+    assert capsys.readouterr().out.splitlines() == [
+        "CPU: ACTIVE",
+        "Memory: IDLE",
+        "API Server: IDLE",
+        "GPU: N/A",
+        "Operators: ACTIVE",
+        "Oversized: true (2 level-idle nodes)",
+        "STATUS: ACTIVE (Operators at 350% of threshold)",
+    ]
 
     report = json.loads(json_path.read_text())
     criteria = report["criteria"]
@@ -292,6 +304,77 @@ def test_active_cluster_quiet(monkeypatch, prom_server, tmp_path, capsys):
     assert criteria["memory"]["result"] == "IDLE"
     assert criteria["api_server"]["result"] == "IDLE"
     assert criteria["operators"]["result"] == "ACTIVE"
+    # node-2's 50% window made the cluster active, but node-1 and node-3
+    # never crossed the peak threshold - they are the right-sizing signal.
+    assert report["oversized"] == {
+        "result": True,
+        "gpu_peak": None,
+        "nodes": [
+            {"node": "node-1", "cpu_peak": 5.0, "gpu_node": False},
+            {"node": "node-3", "cpu_peak": 5.0, "gpu_node": False},
+        ],
+    }
+
+
+def test_oversized_names_level_idle_workers_on_a_variance_active_cluster(
+    monkeypatch, prom_server, tmp_path, capsys
+):
+    # The cluster is ACTIVE purely on CPU variance - worker-1's low-level
+    # burst (1% -> 15%) never crosses the 30% peak threshold, so without the
+    # variance check every node would have been judged inactive.  The quiet
+    # master is expected, not right-sizing evidence, so only the workers are
+    # named.
+    url, responses = prom_server
+    monkeypatch.setenv("OCP_IDLE_PROMETHEUS_URL", url)
+    oc_responses = base_oc_responses(
+        [
+            node_item("master-0", roles=["node-role.kubernetes.io/master"]),
+            node_item("worker-1"),
+            node_item("worker-2"),
+        ]
+    )
+    oc_responses[("get", "pods", "-A", "-o", oic.PODS_ALL_JSONPATH)] = OPERATOR_PODS_YOUNG
+    oc_responses[("get", "rs", "-A", "-o", oic.REPLICASETS_ALL_JSONPATH)] = (
+        OPERATOR_REPLICASETS_YOUNG
+    )
+    # Verbose mode also pulls the machine list for the ML node display.
+    oc_responses[("get", "machines", "-n", "openshift-machine-api", "-o", "json")] = '{"items": []}'
+    install_fake_oc(monkeypatch, oc_responses)
+    responses[("/api/v1/query_range", oic.CPU_RANGE_QUERY)] = prom_range_json(
+        [
+            make_range_series("master-0", ["10"] * 8),
+            make_range_series("worker-1", ["1", "1", "15"] + ["1"] * 5),
+            make_range_series("worker-2", ["2"] * 8),
+        ]
+    )
+    quiet_memory_and_api(responses, ["master-0", "worker-1", "worker-2"])
+
+    json_path = tmp_path / "report.json"
+    exit_code = oic.run(["--json", str(json_path), "-w", str(WINDOW)])
+    assert exit_code == 0
+    captured = capsys.readouterr()
+    assert captured.out.splitlines() == [
+        "CPU: ACTIVE",
+        "Memory: IDLE",
+        "API Server: IDLE",
+        "GPU: N/A",
+        "Operators: ACTIVE",
+        "Oversized: true (2 level-idle nodes)",
+        "STATUS: ACTIVE (Operators at 350% of threshold)",
+    ]
+    assert "Level-idle node: worker-1 (CPU peak 15.0%)" in captured.err
+    assert "Level-idle node: worker-2 (CPU peak 2.0%)" in captured.err
+    assert "Level-idle node: master-0" not in captured.err
+
+    report = json.loads(json_path.read_text())
+    assert report["oversized"] == {
+        "result": True,
+        "gpu_peak": None,
+        "nodes": [
+            {"node": "worker-1", "cpu_peak": 15.0, "gpu_node": False},
+            {"node": "worker-2", "cpu_peak": 2.0, "gpu_node": False},
+        ],
+    }
 
 
 def test_operator_listing_failure_reports_unknown(monkeypatch, prom_server, tmp_path, capsys):
@@ -390,11 +473,13 @@ def test_gpu_cluster_adds_fifth_criterion(monkeypatch, prom_server, tmp_path):
     )
     calls = install_fake_oc(monkeypatch, oc_responses)
 
-    quiet_cpu(responses, ["node-1"])
+    quiet_cpu(responses, ["node-1", "gpu-node-1"])
     quiet_memory_and_api(responses, ["node-1", "gpu-node-1"])
-    # One 15-minute window at 80% GPU utilization.
+    # One 15-minute window at 12% GPU utilization: over the 5% variance
+    # floor on a zero baseline (the burst branch fires well under the 40%
+    # peak threshold), and enough to touch the GPU.
     responses[("/api/v1/query_range", oic.GPU_RANGE_QUERY)] = prom_range_json(
-        [make_dcgm_series(["0", "0", "0", "80"])]
+        [make_dcgm_series(["0", "0", "0", "12"])]
     )
     # Batched windowed usage queries from the gpu report (the ML node
     # display is verbose-only, so a quiet run never issues its query).
@@ -415,7 +500,8 @@ def test_gpu_cluster_adds_fifth_criterion(monkeypatch, prom_server, tmp_path):
     # Five criteria now; cpu, memory, and api vote IDLE - 3 of 5 is below 80%.
     assert (criteria["total"], criteria["met"], criteria["threshold"]) == (5, 3, 4)
     assert criteria["gpu"]["result"] == "ACTIVE"
-    # The 80% window cleared its firing level: the ratio sits past 1.0.
+    # The 12% window cleared its firing level - the 5% floor on a zero
+    # baseline - so the ratio sits past 1.0.
     assert criteria["gpu"]["threshold_ratio"] > 1
     gpu = report["gpu"]
     assert gpu["has_gpu_nodes"] is True
@@ -426,6 +512,74 @@ def test_gpu_cluster_adds_fifth_criterion(monkeypatch, prom_server, tmp_path):
         "memory_current": "6.00",
         "cpu_windowed": "7.00",
         "memory_windowed": "11.00",
+    }
+    # Both workers stayed under the CPU peak threshold, but the GPU node is
+    # not named: its GPU series met the variance floor (12% over 5%), and a
+    # touched GPU reads as in use - VRAM capacity is often why it was
+    # picked, and utilization is a weak signal for that.
+    assert report["oversized"] == {
+        "result": True,
+        "gpu_peak": None,
+        "nodes": [{"node": "node-1", "cpu_peak": 2.0, "gpu_node": False}],
+    }
+
+
+def test_oversized_gpu_node_carries_the_cluster_wide_gpu_peak(
+    monkeypatch, prom_server, tmp_path, capsys
+):
+    # The one run where a GPU node is actually named: node-1's CPU burst
+    # keeps the cluster ACTIVE, the GPU node's CPU never crosses the peak
+    # threshold, and no DCGM series ever meets the 5% variance floor - the
+    # GPU was never touched, so the node is acquirable.  gpu_peak then
+    # records the hottest series cluster-wide, the acquittal's receipt, not
+    # the node's own peak (series cannot be attributed to node names).
+    url, responses = prom_server
+    monkeypatch.setenv("OCP_IDLE_PROMETHEUS_URL", url)
+    nodes = [node_item("node-1"), node_item("gpu-node-1", instance_type="g5.xlarge", gpus="4")]
+    oc_responses = base_oc_responses(nodes)
+    oc_responses[("get", "pods", "-A", "-o", oic.PODS_ALL_JSONPATH)] = OPERATOR_PODS_YOUNG
+    oc_responses[("get", "rs", "-A", "-o", oic.REPLICASETS_ALL_JSONPATH)] = (
+        OPERATOR_REPLICASETS_YOUNG
+    )
+    install_fake_oc(monkeypatch, oc_responses)
+
+    # One 15-minute window at 50% CPU on node-1: the cluster is ACTIVE, but
+    # node-1 crossed the peak threshold so only the GPU node can be named.
+    responses[("/api/v1/query_range", oic.CPU_RANGE_QUERY)] = prom_range_json(
+        [
+            make_range_series("node-1", ["5", "5", "50"] + ["5"] * 5),
+            make_range_series("gpu-node-1", ["2"] * 8),
+        ]
+    )
+    quiet_memory_and_api(responses, ["node-1", "gpu-node-1"])
+    # Two exporters on the cluster, the hotter peaking at 4% - under the
+    # 5% variance floor (DCGM's idle noise tail), so the GPUs were never
+    # touched and every GPU node is acquirable.
+    responses[("/api/v1/query_range", oic.GPU_RANGE_QUERY)] = prom_range_json(
+        [
+            make_dcgm_series(["4"] * 8, instance="10.130.2.24:9400"),
+            make_dcgm_series(["0"] * 8, instance="10.130.2.25:9400", gpu="1"),
+        ]
+    )
+    # Batched windowed usage queries from the gpu report (the ML node
+    # display is verbose-only, so a quiet run never issues its query).
+    responses[("/api/v1/query", node_cpu_window_query(["gpu-node-1"], WINDOW))] = (
+        prom_instant_series_json({"gpu-node-1:9100": "7"})
+    )
+    responses[("/api/v1/query", node_mem_window_query(["gpu-node-1"], WINDOW))] = (
+        prom_instant_series_json({"gpu-node-1:9100": "11"})
+    )
+
+    json_path = tmp_path / "report.json"
+    exit_code = oic.run(["-q", "--json", str(json_path), "-w", str(WINDOW)])
+    assert exit_code == 0
+    assert "Oversized: true (1 level-idle node)" in capsys.readouterr().out
+
+    report = json.loads(json_path.read_text())
+    assert report["oversized"] == {
+        "result": True,
+        "gpu_peak": 4.0,
+        "nodes": [{"node": "gpu-node-1", "cpu_peak": 2.0, "gpu_node": True}],
     }
 
 
@@ -533,6 +687,10 @@ def test_unknown_votes_depriving_the_quorum_annotate_status(
         "threshold_ratio": 0.19,
         "quorum_driven": True,
     }
+    # Nothing fired, so the ACTIVE verdict carries no right-sizing claim -
+    # and no Oversized line printed above.
+    report = json.loads(json_path.read_text())
+    assert report["oversized"] == {"result": False, "gpu_peak": None, "nodes": []}
 
 
 # === BASH SHIM SMOKE TESTS ==================================================
