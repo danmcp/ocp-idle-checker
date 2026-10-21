@@ -31,6 +31,8 @@ def test_variance_rule_defaults():
     assert cfg.gpu_peak_threshold == 40.0
     assert cfg.gpu_variance_ratio == 2.0
     assert cfg.api_variance_ratio == 2.0
+    assert cfg.memory_variance_points == 10.0
+    assert cfg.memory_variance_windows == 4
 
 
 def test_window_flag():
@@ -59,6 +61,10 @@ def test_variance_rule_flags():
             "2.5",
             "--api-variance-ratio",
             "4",
+            "--memory-variance-points",
+            "6",
+            "--memory-variance-windows",
+            "3",
         ]
     )
     assert cfg.cpu_peak_threshold == 55.0
@@ -66,6 +72,8 @@ def test_variance_rule_flags():
     assert cfg.gpu_peak_threshold == 60.0
     assert cfg.gpu_variance_ratio == 2.5
     assert cfg.api_variance_ratio == 4.0
+    assert cfg.memory_variance_points == 6.0
+    assert cfg.memory_variance_windows == 3
 
 
 def test_removed_and_renamed_variance_flags_are_rejected():

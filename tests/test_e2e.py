@@ -23,7 +23,6 @@ from helpers import (
     make_dcgm_series,
     make_event,
     make_range_series,
-    memory_window_query,
     node_cpu_window_query,
     node_mem_window_query,
     pod_row,
@@ -151,8 +150,12 @@ def quiet_cpu(responses: dict, nodes: list[str]) -> None:
     )
 
 
-def quiet_memory_and_api(responses: dict) -> None:
-    responses[("/api/v1/query", memory_window_query(WINDOW))] = prom_instant_json("10")
+def quiet_memory_and_api(responses: dict, nodes: list[str]) -> None:
+    # Flat per-node windows: the movement rule sees no rise, and the level
+    # (10%) is irrelevant to it - only the legacy rule ever read levels.
+    responses[("/api/v1/query_range", oic.MEMORY_RANGE_QUERY)] = prom_range_json(
+        [make_range_series(n, ["10"] * 8) for n in nodes]
+    )
     responses[("/api/v1/query", api_avg_query(WINDOW))] = prom_instant_json("5")
     responses[("/api/v1/query_range", oic.API_RANGE_QUERY)] = prom_range_json(
         [{"metric": {}, "values": [[i * 900, "5"] for i in range(8)]}]
@@ -173,7 +176,7 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
     oc_responses[("get", "machines", "-n", "openshift-machine-api", "-o", "json")] = '{"items": []}'
     calls = install_fake_oc(monkeypatch, oc_responses)
     quiet_cpu(responses, ["node-1", "node-2", "node-3"])
-    quiet_memory_and_api(responses)
+    quiet_memory_and_api(responses, ["node-1", "node-2", "node-3"])
 
     json_path = tmp_path / "report.json"
     exit_code = oic.run(["--json", str(json_path), "-w", str(WINDOW)])
@@ -216,6 +219,8 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
         "gpu_peak_threshold",
         "gpu_variance_ratio",
         "api_variance_ratio",
+        "memory_variance_points",
+        "memory_variance_windows",
     ]
     criteria = report["criteria"]
     assert list(criteria) == [
@@ -268,7 +273,7 @@ def test_active_cluster_quiet(monkeypatch, prom_server, tmp_path, capsys):
             make_range_series("node-3", ["5"] * 8),
         ]
     )
-    quiet_memory_and_api(responses)
+    quiet_memory_and_api(responses, ["node-1", "node-2", "node-3"])
 
     json_path = tmp_path / "report.json"
     exit_code = oic.run(["-q", "--json", str(json_path), "-w", str(WINDOW)])
@@ -301,7 +306,7 @@ def test_operator_listing_failure_reports_unknown(monkeypatch, prom_server, tmp_
     oc_responses[("get", "pods", "-A", "-o", oic.PODS_ALL_JSONPATH)] = None
     install_fake_oc(monkeypatch, oc_responses)
     quiet_cpu(responses, ["node-1", "node-2", "node-3"])
-    quiet_memory_and_api(responses)
+    quiet_memory_and_api(responses, ["node-1", "node-2", "node-3"])
 
     json_path = tmp_path / "report.json"
     exit_code = oic.run(["-q", "--json", str(json_path), "-w", str(WINDOW)])
@@ -312,7 +317,7 @@ def test_operator_listing_failure_reports_unknown(monkeypatch, prom_server, tmp_
         "API Server: IDLE",
         "GPU: N/A",
         "Operators: UNKNOWN",
-        "STATUS: IDLE (closest to active: Memory at 29% of threshold)",
+        "STATUS: IDLE (closest to active: API Server at 19% of threshold)",
     ]
 
     report = json.loads(json_path.read_text())
@@ -338,7 +343,7 @@ def test_node_listing_failure_reports_gpu_unknown(monkeypatch, prom_server, tmp_
     oc_responses[("get", "nodes", "-o", "json")] = None
     install_fake_oc(monkeypatch, oc_responses)
     quiet_cpu(responses, ["node-1", "node-2", "node-3"])
-    quiet_memory_and_api(responses)
+    quiet_memory_and_api(responses, ["node-1", "node-2", "node-3"])
 
     json_path = tmp_path / "report.json"
     exit_code = oic.run(["-q", "--json", str(json_path), "-w", str(WINDOW)])
@@ -386,7 +391,7 @@ def test_gpu_cluster_adds_fifth_criterion(monkeypatch, prom_server, tmp_path):
     calls = install_fake_oc(monkeypatch, oc_responses)
 
     quiet_cpu(responses, ["node-1"])
-    quiet_memory_and_api(responses)
+    quiet_memory_and_api(responses, ["node-1", "gpu-node-1"])
     # One 15-minute window at 80% GPU utilization.
     responses[("/api/v1/query_range", oic.GPU_RANGE_QUERY)] = prom_range_json(
         [make_dcgm_series(["0", "0", "0", "80"])]
@@ -438,7 +443,7 @@ def test_verbose_gpu_cluster_reports_ml_nodes(monkeypatch, prom_server, tmp_path
     calls = install_fake_oc(monkeypatch, oc_responses)
 
     quiet_cpu(responses, ["node-1"])
-    quiet_memory_and_api(responses)
+    quiet_memory_and_api(responses, ["node-1", "gpu-node-1"])
     responses[("/api/v1/query_range", oic.GPU_RANGE_QUERY)] = prom_range_json(
         [make_dcgm_series(["0"] * 8)]
     )
@@ -468,7 +473,7 @@ def test_csv_export_appends_with_header(monkeypatch, prom_server, tmp_path):
     monkeypatch.setenv("OCP_IDLE_PROMETHEUS_URL", url)
     install_fake_oc(monkeypatch, base_oc_responses([node_item("node-1")]))
     quiet_cpu(responses, ["node-1"])
-    quiet_memory_and_api(responses)
+    quiet_memory_and_api(responses, ["node-1"])
 
     csv_path = tmp_path / "results.csv"
     argv = ["-q", "--csv", str(csv_path), "-w", str(WINDOW)]

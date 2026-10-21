@@ -275,52 +275,215 @@ def test_cpu_window_zero_instant_above_threshold():
 # === MEMORY =================================================================
 
 
-def test_memory_windowed_active():
-    prom = FakeProm(instant={memory_window_query(WINDOW): 40.0})
-    outcome = oic.check_memory(base_config(), prom, 10.0)
+def test_memory_rise_within_span_is_active():
+    # A 15-point jump between two windows - an allocation - clears the
+    # 10-point bar well inside the 4-window span.
+    prom = FakeProm(
+        ranges={oic.MEMORY_RANGE_QUERY: [make_range_series("node-1", ["30", "30", "45", "45"])]}
+    )
+    outcome = oic.check_memory(base_config(), prom, 10.0, {"node-1"})
     assert outcome.result == "ACTIVE"
-    assert outcome.entry["instant_override"] is False
+    assert outcome.counted
+    assert prom.range_calls == [oic.MEMORY_RANGE_QUERY]
+    entry = outcome.entry
+    assert entry["value"] == "15.00"
+    assert entry["max_rise"] == 15.0
+    assert entry["rise_from"] == 30.0
+    assert entry["rise_at"] == "2023-11-14T22:43:20Z"  # the later point of the pair
+    assert entry["rise_exceeded"] is True
+    assert entry["node"] == "node-1"
+    assert entry["source"] == "variance over 15m windows"
 
 
-def test_memory_windowed_idle():
-    prom = FakeProm(instant={memory_window_query(WINDOW): 20.0})
-    outcome = oic.check_memory(base_config(), prom, 30.0)
+def test_memory_mid_window_jump_reads_full_strength():
+    # A 15-point jump landing mid-window splits across two window averages
+    # (40 -> 47.5 -> 55): adjacent steps read only +7.5, but the span
+    # compares a fully-before window with a fully-after one and reads +15,
+    # wherever the jump falls.
+    prom = FakeProm(
+        ranges={oic.MEMORY_RANGE_QUERY: [make_range_series("node-1", ["40", "47.5", "55", "55"])]}
+    )
+    outcome = oic.check_memory(base_config(), prom, None, {"node-1"})
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["max_rise"] == 15.0
+    assert outcome.entry["max_rise_by_span"]["2"] == pytest.approx(7.5)
+    assert outcome.entry["max_rise_by_span"]["3"] == pytest.approx(15.0)
+    assert outcome.entry["max_rise_by_span"]["4"] == pytest.approx(15.0)
+
+
+def test_memory_flat_windows_are_idle():
+    # A steady high level is not movement, however far above the old
+    # 35% idle threshold it sits.
+    prom = FakeProm(ranges={oic.MEMORY_RANGE_QUERY: [make_range_series("node-1", ["60"] * 8)]})
+    outcome = oic.check_memory(base_config(), prom, 30.0, {"node-1"})
     assert outcome.result == "IDLE"
-    assert outcome.entry["value"] == "20.00"
-    assert outcome.entry["source"] == "window average"
+    assert outcome.entry["value"] == "0.00"
+    assert outcome.entry["max_rise"] == 0.0
 
 
-def test_memory_instant_override():
-    prom = FakeProm(instant={memory_window_query(WINDOW): 20.0})
-    outcome = oic.check_memory(base_config(), prom, 50.0)
+def test_memory_slow_drift_stays_below_the_bar():
+    # A point per window is fast page-cache drift; even across the whole
+    # span it reaches 3 points, nowhere near the bar.
+    prom = FakeProm(
+        ranges={oic.MEMORY_RANGE_QUERY: [make_range_series("node-1", ["40", "41", "42", "43"])]}
+    )
+    outcome = oic.check_memory(base_config(), prom, None, {"node-1"})
+    assert outcome.result == "IDLE"
+    assert outcome.entry["max_rise"] == 3.0
+
+
+def test_memory_fast_ramp_fires():
+    # 4 points per window is ~16 points/hour - a workload ramping up, not
+    # drift; the distance-3 pair reads 12, past the bar.
+    prom = FakeProm(
+        ranges={oic.MEMORY_RANGE_QUERY: [make_range_series("node-1", ["40", "44", "48", "52"])]}
+    )
+    outcome = oic.check_memory(base_config(), prom, None, {"node-1"})
     assert outcome.result == "ACTIVE"
-    assert outcome.entry["instant_override"] is True
+
+
+def test_memory_span_and_points_are_configurable():
+    prom = FakeProm(
+        ranges={oic.MEMORY_RANGE_QUERY: [make_range_series("node-1", ["40", "44", "48", "52"])]}
+    )
+    # +4/window reads 12 across 4 windows (fires) but only 8 across a
+    # 3-window span (quiet), and the points bar can be moved past either.
+    assert oic.check_memory(base_config(), prom, None, {"node-1"}).result == "ACTIVE"
+    outcome = oic.check_memory(base_config(memory_variance_windows=3), prom, None, {"node-1"})
+    assert outcome.result == "IDLE"
+    assert outcome.entry["value"] == "8.00"
+    assert (
+        oic.check_memory(base_config(memory_variance_points=20.0), prom, None, {"node-1"}).result
+        == "IDLE"
+    )
+
+
+def test_memory_drop_does_not_vote():
+    # A drain - the largest decrease - is debug, not activity.
+    prom = FakeProm(
+        ranges={oic.MEMORY_RANGE_QUERY: [make_range_series("node-1", ["60", "55", "50", "45"])]}
+    )
+    outcome = oic.check_memory(base_config(), prom, None, {"node-1"})
+    assert outcome.result == "IDLE"
+    entry = outcome.entry
+    assert entry["max_drop"] == -15.0
+    assert entry["rise_exceeded"] is False
+    assert entry["threshold_ratio"] == 0.0
+
+
+def test_memory_data_hole_is_not_a_step():
+    # The pair test is on timestamps, not index distance: a series that
+    # holes for hours simply has no pair across the hole, so the pre-hole
+    # 40 and the post-hole 70 never compare.
+    series = {
+        "metric": {"node": "node-1", "instance": "node-1:9100"},
+        "values": [
+            [1700000000, "40"],
+            [1700000900, "40"],
+            [1700018000, "70"],  # five hours later
+            [1700018900, "70"],
+        ],
+    }
+    prom = FakeProm(ranges={oic.MEMORY_RANGE_QUERY: [series]})
+    outcome = oic.check_memory(base_config(), prom, None, {"node-1"})
+    assert outcome.result == "IDLE"
+    assert outcome.entry["max_rise"] == 0.0
+
+
+def test_memory_dead_node_history_does_not_vote():
+    # A deleted node's refill is history, not activity: only live nodes
+    # are judged (same filter as the CPU variance rule).
+    prom = FakeProm(
+        ranges={
+            oic.MEMORY_RANGE_QUERY: [
+                make_range_series("node-1", ["30"] * 4),
+                make_range_series("deleted-node", ["30", "30", "45", "45"]),
+            ]
+        }
+    )
+    outcome = oic.check_memory(base_config(), prom, None, {"node-1"})
+    assert outcome.result == "IDLE"
+    assert [p["node"] for p in outcome.entry["per_node"]] == ["node-1"]
+
+
+def test_memory_instant_no_longer_overrides_an_idle_ruling():
+    # The one-directional instant override is gone: a busy snapshot over
+    # quiet windows is information, not a vote (single-snapshot +10-point
+    # deviations hit idle and active cluster nodes at the same rate).
+    prom = FakeProm(ranges={oic.MEMORY_RANGE_QUERY: [make_range_series("node-1", ["20"] * 4)]})
+    outcome = oic.check_memory(base_config(), prom, 50.0, {"node-1"})
+    assert outcome.result == "IDLE"
+    assert outcome.entry["instant"] == 50.0
+    assert "instant_override" not in outcome.entry
+    assert outcome.entry["threshold_ratio"] == 0.0
+
+
+def test_memory_threshold_ratio_is_the_hottest_node_rise():
+    prom = FakeProm(
+        ranges={
+            oic.MEMORY_RANGE_QUERY: [
+                make_range_series("node-1", ["30", "30", "33", "33"]),  # +3
+                make_range_series("node-2", ["20", "20", "26", "26"]),  # +6
+            ]
+        }
+    )
+    outcome = oic.check_memory(base_config(), prom, None, {"node-1", "node-2"})
+    assert outcome.result == "IDLE"
+    assert outcome.entry["threshold_ratio"] == pytest.approx(0.6)
+    assert outcome.entry["node"] == "node-2"
+    assert outcome.entry["value"] == "6.00"
+
+
+def test_memory_fallback_window_average_when_matrix_unavailable():
+    # Range matrix missing (query_range fails or returns nothing): the
+    # legacy window-average rule decides, as in check_cpu.
+    prom = FakeProm(instant={memory_window_query(WINDOW): 40.0})
+    outcome = oic.check_memory(base_config(), prom, 10.0, {"node-1"})
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["source"] == "legacy window average"
+    assert outcome.entry["window_average"] == 40.0
+    assert outcome.entry["threshold_ratio"] == pytest.approx(40 / 35, abs=0.01)
+
+
+def test_memory_fallback_window_average_idle():
+    prom = FakeProm(instant={memory_window_query(WINDOW): 20.0})
+    outcome = oic.check_memory(base_config(), prom, 30.0, {"node-1"})
+    assert outcome.result == "IDLE"
+    assert outcome.entry["source"] == "legacy window average"
+    assert outcome.entry["value"] == "20.00"
+    assert outcome.entry["threshold_ratio"] == pytest.approx(20 / 35, abs=0.01)
+
+
+def test_memory_fallback_instant_still_does_not_override():
+    prom = FakeProm(instant={memory_window_query(WINDOW): 20.0})
+    outcome = oic.check_memory(base_config(), prom, 50.0, {"node-1"})
+    assert outcome.result == "IDLE"
+    assert outcome.entry["instant"] == 50.0
 
 
 def test_memory_instant_only_when_window_zero():
-    outcome = oic.check_memory(base_config(time_window_minutes=0), FakeProm(), 40.0)
+    outcome = oic.check_memory(base_config(time_window_minutes=0), FakeProm(), 40.0, None)
     assert outcome.result == "ACTIVE"
-    outcome = oic.check_memory(base_config(time_window_minutes=0), FakeProm(), 20.0)
+    outcome = oic.check_memory(base_config(time_window_minutes=0), FakeProm(), 20.0, None)
     assert outcome.result == "IDLE"
 
 
 def test_memory_no_data_is_unknown_but_counted():
-    outcome = oic.check_memory(base_config(), FakeProm(), None)
+    outcome = oic.check_memory(base_config(), FakeProm(), None, {"node-1"})
     assert outcome.result == "UNKNOWN"
     assert outcome.counted
 
 
 def test_memory_no_windowed_data_busy_instant_is_active():
-    outcome = oic.check_memory(base_config(), FakeProm(), 50.0)
+    outcome = oic.check_memory(base_config(), FakeProm(), 50.0, {"node-1"})
     assert outcome.result == "ACTIVE"
     assert outcome.entry["source"] == "instant"
-    assert outcome.entry["instant_override"] is False
 
 
 def test_memory_no_windowed_data_quiet_instant_is_unknown():
     # Same rule as cpu: a quiet instant is one sample of the window and
     # cannot acquit it (bash voted IDLE here; deliberate divergence).
-    outcome = oic.check_memory(base_config(), FakeProm(), 20.0)
+    outcome = oic.check_memory(base_config(), FakeProm(), 20.0, {"node-1"})
     assert outcome.result == "UNKNOWN"
     assert outcome.counted
     assert outcome.entry["source"] == "instant"
@@ -1080,19 +1243,16 @@ def test_cpu_threshold_ratio_max_across_nodes():
     assert outcome.entry["threshold_ratio"] == pytest.approx(1.06, abs=0.01)
 
 
-def test_memory_threshold_ratio_windowed():
-    prom = FakeProm(instant={memory_window_query(WINDOW): 20.0})
-    outcome = oic.check_memory(base_config(), prom, None)
-    assert outcome.result == "IDLE"
-    assert outcome.entry["threshold_ratio"] == pytest.approx(20 / 35, abs=0.01)
-
-
-def test_memory_threshold_ratio_instant_override_counts():
-    prom = FakeProm(instant={memory_window_query(WINDOW): 20.0})
-    outcome = oic.check_memory(base_config(), prom, 50.0)
+def test_memory_threshold_ratio_variance_branch():
+    # 15 points of rise against the 10-point bar - the hottest node's rise
+    # as a fraction of the level that fires it.  The instant does not
+    # contribute on the windowed paths: it cannot fire there.
+    prom = FakeProm(
+        ranges={oic.MEMORY_RANGE_QUERY: [make_range_series("node-1", ["40", "47.5", "55", "55"])]}
+    )
+    outcome = oic.check_memory(base_config(), prom, 90.0, {"node-1"})
     assert outcome.result == "ACTIVE"
-    assert outcome.entry["instant_override"] is True
-    assert outcome.entry["threshold_ratio"] == pytest.approx(50 / 35, abs=0.01)
+    assert outcome.entry["threshold_ratio"] == pytest.approx(1.5)
 
 
 def test_api_threshold_ratio_variance_branch():
@@ -1185,8 +1345,8 @@ def test_threshold_ratio_separates_active_from_idle():
         oic.check_cpu(base_config(), peak, {"node-1"}, None),
         oic.check_cpu(base_config(), variance, {"node-1"}, None),
         oic.check_cpu(base_config(), idle_windows, {"node-1"}, 2.0),
-        oic.check_memory(base_config(), busy_mem, 10.0),
-        oic.check_memory(base_config(), quiet_mem, 30.0),
+        oic.check_memory(base_config(), busy_mem, 10.0, {"node-1"}),
+        oic.check_memory(base_config(), quiet_mem, 30.0, {"node-1"}),
         oic.check_gpu(base_config(), gpu_active, [gpu_node()]),
         oic.check_gpu(base_config(), gpu_idle, [gpu_node()]),
     ]

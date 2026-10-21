@@ -295,3 +295,114 @@ def test_defaults_catch_the_false_idle_cores():
         floor=oic.CPU_VARIANCE_FLOOR,
     )
     assert low_idle.active
+
+
+# === MEMORY MOVEMENT RULE ===================================================
+
+
+def steps(values, start=0.0, step=900.0):
+    """(timestamp, value) windows at the query_range step."""
+    return [(start + i * step, v) for i, v in enumerate(values)]
+
+
+@pytest.mark.parametrize(
+    ("values", "expected_active", "why"),
+    [
+        ([40.0] * 8, False, "flat: no movement however high the level"),
+        ([40.0, 41.0, 42.0, 43.0], False, "drift: a point a window stays under the bar"),
+        ([40.0, 44.0, 48.0, 52.0], True, "ramp: +4/window reads 12 across the span"),
+        ([40.0, 47.5, 55.0, 55.0], True, "mid-window jump reads at full strength"),
+        ([60.0, 55.0, 50.0, 45.0], False, "a drain never votes"),
+        ([30.0], False, "one window: nothing to compare"),
+        ([], False, "no data"),
+        ([40.0, 50.0], False, "a rise exactly at the bar is not exceeded"),
+    ],
+)
+def test_evaluate_memory_steps(values, expected_active, why):
+    stats = oic.evaluate_memory_steps(steps(values), points_threshold=10.0)
+    assert stats.active is expected_active, why
+
+
+def test_memory_steps_mid_window_jump_dilution_math():
+    # A 15-point jump landing mid-window: each window average moves half
+    # the jump (40 -> 47.5 -> 55), so adjacent steps read +7.5 - under the
+    # bar a 2-window rule would enforce - but the span compares a
+    # fully-before window with a fully-after one and reads +15.
+    stats = oic.evaluate_memory_steps(steps([40.0, 47.5, 55.0, 55.0]), points_threshold=10.0)
+    assert stats.max_rise == pytest.approx(15.0)
+    assert stats.rise_from == pytest.approx(40.0)
+    assert stats.rise_at == 2 * 900  # the fully-after window
+    assert stats.max_rise_by_span == pytest.approx({2: 7.5, 3: 15.0, 4: 15.0, 5: 15.0})
+
+
+def test_memory_steps_calibrate_one_window_wider():
+    # Pairs one group wider than the span feed max_rise_by_span only: a
+    # gradual rise reaching 10 points four steps apart (a 5-window group)
+    # stays idle under the default span but shows up in the calibration
+    # table, so one run reports what a wider span would catch.
+    points = steps([40.0, 42.5, 45.0, 47.5, 50.0])
+    stats = oic.evaluate_memory_steps(points, points_threshold=10.0)
+    assert not stats.active
+    assert stats.max_rise == pytest.approx(7.5)
+    assert stats.max_rise_by_span[5] == pytest.approx(10.0)
+
+
+def test_memory_steps_gap_guard_slides_past_a_hole():
+    # The pair test is on timestamps, not index distance: with a hours-long
+    # hole, the pre-hole and post-hole levels never compare, so the windows
+    # after the hole form their own sliding group instead of fabricating a
+    # step across the hole.
+    points = [*steps([40.0, 40.0]), (10_800.0, 70.0), (11_700.0, 70.0)]
+    stats = oic.evaluate_memory_steps(points, points_threshold=10.0)
+    assert stats.max_rise == 0.0
+    assert stats.points == 4
+
+
+def test_memory_steps_drop_is_debug_only():
+    stats = oic.evaluate_memory_steps(steps([60.0, 55.0, 50.0, 45.0]), points_threshold=10.0)
+    assert not stats.active
+    assert stats.max_rise == 0.0
+    assert stats.max_drop == pytest.approx(-15.0)
+    assert stats.drop_at == 3 * 900
+
+
+def test_evaluate_memory_steps_by_node_groups_filters_and_cleans():
+    series = [
+        make_range_series("live-a", ["30", "30", "45", "45"]),
+        make_range_series("live-b", ["20"] * 4),
+        make_range_series("dead", ["10", "10", "40", "40"]),
+    ]
+    per_node = oic.evaluate_memory_steps_by_node(
+        series, points_threshold=10.0, live_nodes={"live-a", "live-b"}
+    )
+    assert [s.node for s in per_node] == ["live-a", "live-b"]  # sorted, dead dropped
+    summary = oic.summarize_memory_steps(per_node)
+    assert summary.active
+    assert summary.node == "live-a"  # the largest rise drives
+    assert summary.points == 8  # pooled across nodes
+    assert summary.rise_exceeded
+
+
+def test_evaluate_memory_steps_by_node_keys_on_instance():
+    # OCP node series carry no `node` label, only `instance` (host:port) -
+    # the same grouping as the CPU variance rule.  Junk samples drop
+    # rather than poison the pairs.
+    series = [
+        {
+            "metric": {"instance": "ip-10-0-1-2.ec2.internal:9100"},
+            "values": [[0, "30"], [900, "junk"], [1800, "45"]],
+        }
+    ]
+    per_node = oic.evaluate_memory_steps_by_node(series, points_threshold=10.0)
+    assert len(per_node) == 1
+    assert per_node[0].node == "ip-10-0-1-2.ec2.internal"
+    assert per_node[0].points == 2
+    assert per_node[0].active  # the surviving pair still reads +15
+
+
+def test_summarize_memory_steps_empty_is_zeroed():
+    stats = oic.summarize_memory_steps([])
+    assert stats.points == 0
+    assert not stats.active
+    assert stats.max_rise == 0.0
+    assert stats.rise_at is None
