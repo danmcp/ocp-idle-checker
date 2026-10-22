@@ -209,11 +209,16 @@ timestamp,cluster,status,cpu_result,cpu_value,memory_result,...,gpu_result,gpu_v
     "flavors": "NVIDIA(g4dn.xlarge)",
     "usage": { "cpu_current": "7.00", "cpu_windowed": "6.58", ... }
   },
-  "oversized": { "result": false, "gpu_peak": null, "nodes": [] }
+  "oversized": { "result": false, "gpu_peak": null, "nodes": [] },
+  "nodes": [
+    { "name": "worker-0", "provider_id": "aws:///us-east-2a/i-0123456789abcdef0", "role": "worker", "instance_type": "m5.xlarge" }
+  ]
 }
 ```
 
 `criteria` keeps each criterion's headline fields — `result`, `value`, `threshold_ratio`, plus `age_days` and `events` for operators — so renderers that print it verbatim (the Jenkins report's Metrics column) stay compact. The diagnostics behind those fields (per-node variance numbers, operator units, failure reasons) are not exported.
+
+The `nodes` section lists every node's cloud identity — name, provider ID, role, and instance type — so a result can be joined back to its cloud instances after the fact. When the `oc get nodes` listing itself fails it is `null`, not `[]`, for the same reason `has_gpu_nodes` goes unknown: a failed listing is not an empty cluster. The CSV is unchanged.
 
 ## Use Cases
 

@@ -308,6 +308,47 @@ def test_worker_nodes_from_items_drops_role_labeled_nodes():
     assert oic.worker_nodes_from_items(items) == {"worker-0", "bare-0"}
 
 
+def test_node_inventory_lists_every_node_with_cloud_identity():
+    items = [
+        {
+            "metadata": {
+                "name": "worker-0",
+                "labels": {
+                    "node-role.kubernetes.io/worker": "",
+                    "node.kubernetes.io/instance-type": "m5.xlarge",
+                },
+            },
+            "spec": {"providerID": "aws:///us-east-2a/i-0123456789abcdef0"},
+        },
+        {
+            "metadata": {"name": "master-0", "labels": {"node-role.kubernetes.io/master": ""}},
+            "spec": {"providerID": "gce://project/zones/us-east1-b/instances/node-1"},
+        },
+        # No role label, no providerID, no instance type: defaults, not gaps.
+        {"metadata": {"name": "bare-0", "labels": {}}},
+    ]
+    assert oic.node_inventory(items) == [
+        {
+            "name": "worker-0",
+            "provider_id": "aws:///us-east-2a/i-0123456789abcdef0",
+            "role": "worker",
+            "instance_type": "m5.xlarge",
+        },
+        {
+            "name": "master-0",
+            "provider_id": "gce://project/zones/us-east1-b/instances/node-1",
+            "role": "master",
+            "instance_type": "",
+        },
+        {"name": "bare-0", "provider_id": "", "role": "worker", "instance_type": ""},
+    ]
+
+
+def test_node_inventory_failed_listing_is_none():
+    # A failed listing is not an empty cluster.
+    assert oic.node_inventory(None) is None
+
+
 # === CRITERIA SUMMARY =======================================================
 
 
@@ -420,6 +461,14 @@ def sample_report() -> dict:
             },
         },
         "oversized": {"result": False, "gpu_peak": None, "nodes": []},
+        "nodes": [
+            {
+                "name": "worker-0",
+                "provider_id": "aws:///us-east-2a/i-0123456789abcdef0",
+                "role": "worker",
+                "instance_type": "m5.xlarge",
+            }
+        ],
     }
 
 

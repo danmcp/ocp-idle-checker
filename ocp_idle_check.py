@@ -838,6 +838,33 @@ def node_instance_type(item: dict[str, Any]) -> str:
     return str(labels.get("node.kubernetes.io/instance-type", ""))
 
 
+def node_inventory(items: list[dict[str, Any]] | None) -> list[dict[str, Any]] | None:
+    """Per-node cloud identity for the JSON report: name, provider ID,
+    role, and instance type.  The provider ID is what ties a node back to
+    its cloud instance.  None when the node listing failed (a failed
+    listing is not an empty cluster)."""
+    if items is None:
+        return None
+    inventory: list[dict[str, Any]] = []
+    for item in items:
+        meta = item.get("metadata", {})
+        labels = meta.get("labels", {})
+        roles = [
+            label.split("/", 1)[1]
+            for label in labels
+            if label.startswith("node-role.kubernetes.io/")
+        ]
+        inventory.append(
+            {
+                "name": str(meta.get("name", "")),
+                "provider_id": str(item.get("spec", {}).get("providerID") or ""),
+                "role": roles[0] if roles else "worker",
+                "instance_type": node_instance_type(item),
+            }
+        )
+    return inventory
+
+
 def cluster_short_name(server: str) -> str:
     """First DNS label after "api." in the server URL (for machine naming)."""
     match = re.search(r"api\.([^:]+)", server)
@@ -2398,6 +2425,7 @@ def run(argv: list[str] | None = None) -> int:
         "criteria": criteria,
         "gpu": gpu_section,
         "oversized": oversized,
+        "nodes": node_inventory(node_items),
     }
 
     # --- Summary ---

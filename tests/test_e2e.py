@@ -123,12 +123,14 @@ def node_item(
     instance_type: str = "m5.xlarge",
     gpus: str | None = None,
     roles: list[str] | None = None,
+    provider_id: str = "",
 ) -> dict:
     capacity = {"nvidia.com/gpu": gpus} if gpus is not None else {}
     labels = {"node.kubernetes.io/instance-type": instance_type}
     labels.update({role: "" for role in roles or []})
     return {
         "metadata": {"name": name, "labels": labels},
+        "spec": {"providerID": provider_id},
         "status": {"capacity": capacity},
     }
 
@@ -173,7 +175,11 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
     url, responses = prom_server
     monkeypatch.setenv("OCP_IDLE_PROMETHEUS_URL", url)
     oc_responses = base_oc_responses(
-        [node_item("node-1"), node_item("node-2"), node_item("node-3")]
+        [
+            node_item("node-1", provider_id="aws:///us-east-2a/i-0123456789abcdef0"),
+            node_item("node-2"),
+            node_item("node-3"),
+        ]
     )
     # Verbose mode also pulls the machine list; the cluster-wide event list
     # is shared with the operators criterion through the Oc cache.
@@ -210,6 +216,7 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
         "criteria",
         "gpu",
         "oversized",
+        "nodes",
     ]
     assert list(report["configuration"]) == [
         "time_window_minutes",
@@ -259,6 +266,17 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
     assert CREATE_TOKEN_ARGS not in calls
     # An IDLE cluster is not oversized, whatever its node levels.
     assert report["oversized"] == {"result": False, "gpu_peak": None, "nodes": []}
+    # Every node's cloud identity rides along for later join-back.
+    assert report["nodes"] == [
+        {
+            "name": "node-1",
+            "provider_id": "aws:///us-east-2a/i-0123456789abcdef0",
+            "role": "worker",
+            "instance_type": "m5.xlarge",
+        },
+        {"name": "node-2", "provider_id": "", "role": "worker", "instance_type": "m5.xlarge"},
+        {"name": "node-3", "provider_id": "", "role": "worker", "instance_type": "m5.xlarge"},
+    ]
 
 
 def test_active_cluster_quiet(monkeypatch, prom_server, tmp_path, capsys):
