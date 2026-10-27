@@ -1,4 +1,4 @@
-"""The five idle criteria and the 80% verdict."""
+"""The five idle criteria, the 80% verdict, and the too-many-UNKNOWNs gate."""
 
 from __future__ import annotations
 
@@ -56,6 +56,10 @@ class CheckOutcome:
     result: str  # IDLE | ACTIVE | UNKNOWN | N/A
     entry: dict[str, Any]
     counted: bool  # counts toward the 80% denominator
+    # UNKNOWN declared for absent windowed data (a quiet instant that cannot
+    # acquit the window), not a failed read: it stays counted but does not
+    # count toward the too-many-UNKNOWNs gate.
+    no_data: bool = False
 
 
 CRITERIA_KEYS = ("cpu", "memory", "api_server", "gpu", "operators")
@@ -158,12 +162,13 @@ def check_cpu(
         # one quiet sample cannot acquit the window.  The override below
         # lets an instant accuse but never acquit; the no-data path is not
         # looser than that.  UNKNOWN, still counted (bash parity for the
-        # no-instant-at-all case).
+        # no-instant-at-all case), but declared rather than failed: it does
+        # not count toward the too-many-UNKNOWNs gate.
         entry["value"] = fmt2(instant_cpu)
         entry["instant"] = instant_cpu
         if instant_cpu is not None:
             entry["source"] = "instant"
-        return CheckOutcome("UNKNOWN", entry, counted=True)
+        return CheckOutcome("UNKNOWN", entry, counted=True, no_data=True)
 
     # One-directional instant override: a live spike beats an idle verdict.
     instant_override = False
@@ -252,13 +257,14 @@ def check_memory(
     else:
         # A window was configured but no windowed data came back, and no
         # instant is busy: either no instant at all, or a quiet one, which
-        # cannot acquit the window (see check_cpu).  UNKNOWN, still counted
-        # (bash parity).
+        # cannot acquit the window (see check_cpu).  UNKNOWN, still
+        # counted, but declared rather than failed: it does not count
+        # toward the too-many-UNKNOWNs gate.
         entry["value"] = fmt2(instant_mem)
         entry["instant"] = instant_mem
         if instant_mem is not None:
             entry["source"] = "instant"
-        return CheckOutcome("UNKNOWN", entry, counted=True)
+        return CheckOutcome("UNKNOWN", entry, counted=True, no_data=True)
 
     # Threshold ratio: the reading closest to firing, as a fraction of the
     # level that fires it - the hottest node's rise against the points
@@ -606,6 +612,25 @@ def compute_verdict(outcomes: list[CheckOutcome]) -> tuple[int, int, int, str, i
     # otherwise; Jenkins keys on this via warnWhenRcNotZero.
     exit_code = 1 if status == "IDLE" else 0
     return total, met, threshold, status, exit_code
+
+
+# A single counted UNKNOWN is survivable (it consumes the one miss the 80%
+# rule tolerates); two mean the verdict would rest on too little data, so
+# the run errors instead of issuing IDLE or ACTIVE.  Only failed reads
+# count: a no-data UNKNOWN (a quiet instant that cannot acquit the window)
+# is an artificial verdict declared to avoid voting, not missing evidence
+# of a failure, so it never trips the gate.
+MAX_COUNTED_UNKNOWNS = 1
+
+
+def counted_unknowns(outcomes: list[CheckOutcome]) -> list[str]:
+    """Labels of the counted UNKNOWNs that count toward the gate: failed
+    reads only, not the declared no-data UNKNOWNs."""
+    return [
+        CRITERIA_LABELS[key]
+        for key, outcome in zip(CRITERIA_KEYS, outcomes, strict=True)
+        if outcome.counted and outcome.result == "UNKNOWN" and not outcome.no_data
+    ]
 
 
 def threshold_focus(outcomes: list[CheckOutcome], status: str) -> dict[str, Any] | None:

@@ -470,6 +470,45 @@ def test_node_listing_failure_reports_gpu_unknown(monkeypatch, prom_server, tmp_
     assert report["gpu"]["node_count"] is None
 
 
+def test_too_many_failed_reads_error(monkeypatch, prom_server, tmp_path, capsys):
+    # The gate's consequence: too many counted UNKNOWNs from failed reads
+    # error out (exit 2) rather than issue a verdict built on too little
+    # data.  Today only a failed node listing produces a gated UNKNOWN (at
+    # most one, under the gate's threshold of two), so the gate is forced
+    # open here by lowering the threshold to zero - the branch must stay
+    # correct for the failed-read sources reason plumbing will add.
+    url, responses = prom_server
+    monkeypatch.setenv("OCP_IDLE_PROMETHEUS_URL", url)
+    monkeypatch.setattr(oic.main, "MAX_COUNTED_UNKNOWNS", 0)
+    oc_responses = base_oc_responses(
+        [node_item("node-1"), node_item("node-2"), node_item("node-3")]
+    )
+    oc_responses[("get", "nodes", "-o", "json")] = None
+    install_fake_oc(monkeypatch, oc_responses)
+    quiet_cpu(responses, ["node-1", "node-2", "node-3"])
+    quiet_memory_and_api(responses, ["node-1", "node-2", "node-3"])
+
+    json_path = tmp_path / "report.json"
+    exit_code = oic.run(["-q", "--json", str(json_path), "-w", str(WINDOW)])
+    assert exit_code == 2
+    assert capsys.readouterr().out.splitlines() == [
+        "CPU: IDLE",
+        "Memory: IDLE",
+        "API Server: IDLE",
+        "GPU: UNKNOWN",
+        "Operators: IDLE",
+        "STATUS: ERROR (too many UNKNOWN criteria: GPU)",
+    ]
+
+    report = json.loads(json_path.read_text())
+    assert report["status"] == "ERROR"
+    assert report["exit_code"] == 2
+    assert report["error"] == "too many UNKNOWN criteria: GPU"
+    # No verdict means no boundary criterion and no right-sizing claim.
+    assert report["criteria"]["driver"] is None
+    assert report["oversized"] == {"result": False, "gpu_peak": None, "nodes": []}
+
+
 def test_gpu_cluster_adds_fifth_criterion(monkeypatch, prom_server, tmp_path):
     url, responses = prom_server
     monkeypatch.setenv("OCP_IDLE_PROMETHEUS_URL", url)
@@ -639,9 +678,11 @@ def test_unknown_votes_depriving_the_quorum_annotate_status(
 ):
     # CPU and memory read UNKNOWN (Prometheus down for their queries, quiet
     # instants) and still count; the operators event listing fails, so it is
-    # UNKNOWN and uncounted.  One IDLE vote of three counted - below the
-    # quorum - makes the verdict ACTIVE with nothing fired, and the STATUS
-    # annotation says so instead of implying a hot criterion.
+    # UNKNOWN and uncounted.  Those UNKNOWNs are declared no-data verdicts,
+    # not failed reads, so they do not trip the too-many-UNKNOWNs gate: one
+    # IDLE vote of three counted - below the quorum - makes the verdict
+    # ACTIVE with nothing fired, and the STATUS annotation says so instead
+    # of implying a hot criterion.
     url, responses = prom_server
     monkeypatch.setenv("OCP_IDLE_PROMETHEUS_URL", url)
     oc_responses = base_oc_responses(

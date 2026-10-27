@@ -57,8 +57,11 @@ plus each criterion's threshold_ratio), two CSV columns, and an annotation
 on the quiet STATUS line, whose "STATUS: <verdict>" prefix stays intact.
 
 A single counted UNKNOWN criterion is survivable (it consumes the one
-miss the 80% rule tolerates); more than that and the verdict rests on
-too little data, degrading toward UNKNOWN-driven ACTIVE.
+miss the 80% rule tolerates); two or more failed reads (UNKNOWN from a
+failed query or listing, not the declared no-data UNKNOWN of a quiet
+instant) mean the verdict would rest on too little data, so the run
+errors: status ERROR, exit 2, and a STATUS line naming the UNKNOWN
+criteria.
 
 The variance parameters (peak threshold, ratio) are fleet calibration
 knobs exposed as command-line flags; the defaults are provisional.  All
@@ -164,6 +167,7 @@ from .criteria import (
     CRITERIA_KEYS,
     CRITERIA_LABELS,
     CRITERIA_SUMMARY_FIELDS,
+    MAX_COUNTED_UNKNOWNS,
     CheckOutcome,
     check_api,
     check_cpu,
@@ -171,6 +175,7 @@ from .criteria import (
     check_memory,
     check_operators,
     compute_verdict,
+    counted_unknowns,
     criteria_summary,
     event_text,
     event_timestamp,
@@ -249,6 +254,7 @@ __all__ = [
     "GPU_VARIANCE_FLOOR",
     "GPU_VARIANCE_RATIO",
     "GREEN",
+    "MAX_COUNTED_UNKNOWNS",
     "MEMORY_IDLE_THRESHOLD",
     "MEMORY_RANGE_QUERY",
     "MEMORY_VARIANCE_POINTS",
@@ -305,6 +311,7 @@ __all__ = [
     "check_operators",
     "cluster_short_name",
     "compute_verdict",
+    "counted_unknowns",
     "criteria_summary",
     "evaluate_memory_steps",
     "evaluate_memory_steps_by_node",

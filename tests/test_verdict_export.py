@@ -1,5 +1,5 @@
-"""Tests for the 80% verdict rule, the threshold-focus pick, the criteria
-summary projection, and the CSV/JSON exports."""
+"""Tests for the 80% verdict rule, the UNKNOWN gate, the threshold-focus
+pick, the criteria summary projection, and the CSV/JSON exports."""
 
 from __future__ import annotations
 
@@ -12,8 +12,12 @@ import ocp_idle_check as oic
 from helpers import base_config
 
 
-def outcome(result: str, counted: bool = True, heat: float | None = None) -> oic.CheckOutcome:
-    return oic.CheckOutcome(result, {"result": result, "threshold_ratio": heat}, counted)
+def outcome(
+    result: str, counted: bool = True, heat: float | None = None, no_data: bool = False
+) -> oic.CheckOutcome:
+    return oic.CheckOutcome(
+        result, {"result": result, "threshold_ratio": heat}, counted, no_data=no_data
+    )
 
 
 # === VERDICT ================================================================
@@ -69,6 +73,59 @@ def outcome(result: str, counted: bool = True, heat: float | None = None) -> oic
 )
 def test_compute_verdict(outcomes, expected):
     assert oic.compute_verdict(outcomes) == expected
+
+
+# === COUNTED UNKNOWNS =======================================================
+
+
+def test_counted_unknowns_lists_only_counted_unknowns():
+    outcomes = [
+        outcome("UNKNOWN"),  # cpu - counted
+        outcome("UNKNOWN"),  # memory - counted
+        outcome("IDLE"),
+        outcome("UNKNOWN", counted=False),  # operators - uncounted
+        outcome("N/A", counted=False),
+    ]
+    assert oic.counted_unknowns(outcomes) == ["CPU", "Memory"]
+
+
+def test_counted_unknowns_empty_when_none():
+    assert oic.counted_unknowns([outcome("IDLE")] * 5) == []
+
+
+def test_counted_unknowns_single_unknown_is_within_the_gate():
+    outcomes = [outcome("UNKNOWN")] + [outcome("IDLE")] * 4
+    unknowns = oic.counted_unknowns(outcomes)
+    assert len(unknowns) == 1
+    assert len(unknowns) <= oic.MAX_COUNTED_UNKNOWNS
+
+
+def test_declared_no_data_unknowns_do_not_trip_the_gate():
+    # A quiet instant with no windowed data declares UNKNOWN to avoid
+    # voting; it stays counted in the denominator but is not a failed
+    # read, so it must not count toward the too-many-UNKNOWNs gate.
+    outcomes = [
+        outcome("UNKNOWN", no_data=True),  # cpu
+        outcome("UNKNOWN", no_data=True),  # memory
+        outcome("IDLE"),
+        outcome("UNKNOWN", counted=False),  # operators - uncounted
+        outcome("N/A", counted=False),
+    ]
+    assert oic.counted_unknowns(outcomes) == []
+
+
+def test_no_data_unknown_plus_failed_read_trips_the_gate():
+    # One declared no-data UNKNOWN and one genuine failure (GPU node
+    # listing): the failure counts, the declaration does not - one gated
+    # UNKNOWN is survivable.
+    outcomes = [
+        outcome("UNKNOWN", no_data=True),  # cpu
+        outcome("IDLE"),  # memory
+        outcome("IDLE"),  # api
+        outcome("UNKNOWN"),  # gpu listing failed
+        outcome("IDLE"),  # operators
+    ]
+    assert oic.counted_unknowns(outcomes) == ["GPU"]
 
 
 # === THRESHOLD FOCUS ========================================================

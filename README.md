@@ -23,7 +23,7 @@ The package splits along the same lines as the checks themselves: `config` (defa
 
 - **1** = Cluster is IDLE (warning - resources may be wasted)
 - **0** = Cluster is ACTIVE (success - resources are being used)
-- **2** = Error (cannot determine state)
+- **2** = Error (including: more than one counted UNKNOWN from failed reads — not enough data for a verdict)
 
 ## Idle Criteria (80% must pass)
 
@@ -114,7 +114,7 @@ Some criteria are **skipped** (not counted in the total) when the required data 
 - **GPU**: skipped on clusters without GPU nodes or without DCGM metrics; when the `oc get nodes` listing itself fails, the criterion instead reads UNKNOWN (counted) — a failed listing is not an empty cluster
 - **Operators**: skipped when no controller pods are found in any scanned namespace
 
-CPU and memory `UNKNOWN` still count toward the denominator (they never help the IDLE count, only the total), and so does a GPU `UNKNOWN` from a failed node listing. A single counted `UNKNOWN` is survivable — it just consumes the one miss the 80% rule tolerates.
+CPU and memory `UNKNOWN` still count toward the denominator (they never help the IDLE count, only the total), and so does a GPU `UNKNOWN` from a failed node listing. A single counted `UNKNOWN` is survivable — it just consumes the one miss the 80% rule tolerates. Two or more counted `UNKNOWN`s **from failed reads** (a failed query or node listing) mean the verdict would rest on too little data, so the run errors instead: status `ERROR`, exit code 2, and a STATUS line naming the UNKNOWN criteria (`STATUS: ERROR (too many UNKNOWN criteria: CPU, Memory)`). The no-data `UNKNOWN` of a quiet instant is different — an artificial verdict declared to avoid voting, not a failed read — so it never trips the gate.
 
 ### Threshold Ratio (how close to the cutoff)
 

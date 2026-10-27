@@ -12,6 +12,7 @@ from typing import Any
 from .config import parse_args
 from .criteria import (
     CRITERIA_KEYS,
+    MAX_COUNTED_UNKNOWNS,
     CheckOutcome,
     check_api,
     check_cpu,
@@ -19,6 +20,7 @@ from .criteria import (
     check_memory,
     check_operators,
     compute_verdict,
+    counted_unknowns,
     criteria_summary,
     format_threshold_ratio,
     threshold_focus,
@@ -29,7 +31,7 @@ from .informational import (
     ml_node_report,
     recent_activity_report,
 )
-from .log import GREEN, NC, YELLOW, log_error, log_info, log_warn, set_verbose
+from .log import GREEN, NC, RED, YELLOW, log_error, log_info, log_warn, set_verbose
 from .nodes import fmt2, gpu_nodes_from_items, instant_averages, worker_nodes_from_items
 from .oc import Oc
 from .oversized import evaluate_oversized
@@ -131,7 +133,17 @@ def run(argv: list[str] | None = None) -> int:
     # --- Verdict ---
     outcomes = [cpu_outcome, memory_outcome, api_outcome, gpu_outcome, operators_outcome]
     total, met, threshold, status, exit_code = compute_verdict(outcomes)
-    focus = threshold_focus(outcomes, status)
+    unknowns = counted_unknowns(outcomes)
+    if len(unknowns) > MAX_COUNTED_UNKNOWNS:
+        # Too many UNKNOWNs (counted) to judge on: error rather than issue a
+        # verdict built on too little data.
+        log_error(
+            f"Too many UNKNOWN criteria ({', '.join(unknowns)}) - not enough data for a verdict"
+        )
+        status, exit_code = "ERROR", 2
+        focus = None
+    else:
+        focus = threshold_focus(outcomes, status)
     oversized = evaluate_oversized(
         status=status,
         quorum_driven=bool(focus and focus["quorum_driven"]),
@@ -175,6 +187,8 @@ def run(argv: list[str] | None = None) -> int:
         "gpu": gpu_section,
         "oversized": oversized,
     }
+    if status == "ERROR":
+        report["error"] = f"too many UNKNOWN criteria: {', '.join(unknowns)}"
 
     # --- Summary ---
     if cfg.verbose:
@@ -206,6 +220,10 @@ def run(argv: list[str] | None = None) -> int:
             print(f"{GREEN}========================================{NC}", file=sys.stderr)
             print(f"{GREEN}  Cluster Status: IDLE{NC}", file=sys.stderr)
             print(f"{GREEN}========================================{NC}", file=sys.stderr)
+        elif status == "ERROR":
+            print(f"{RED}========================================{NC}", file=sys.stderr)
+            print(f"{RED}  Cluster Status: ERROR{NC}", file=sys.stderr)
+            print(f"{RED}========================================{NC}", file=sys.stderr)
         else:
             print(f"{YELLOW}========================================{NC}", file=sys.stderr)
             print(f"{YELLOW}  Cluster Status: ACTIVE{NC}", file=sys.stderr)
@@ -235,6 +253,8 @@ def run(argv: list[str] | None = None) -> int:
             note = f" (UNKNOWN-driven; {focus['label']} at {ratio} of threshold)"
         else:
             note = f" ({focus['label']} at {ratio} of threshold)"
+    elif status == "ERROR":
+        note = f" (too many UNKNOWN criteria: {', '.join(unknowns)})"
     print(f"STATUS: {status}{note}")
 
     if cfg.csv_path is not None:
