@@ -119,27 +119,36 @@ def check_cpu(
     entry: dict[str, Any] = {"result": "UNKNOWN", "value": None, "threshold_ratio": None}
     stats: VarianceStats | None = None
     per_node: list[VarianceStats] = []
+    read_failed = False
 
     if cfg.time_window_minutes > 0:
         start_s, end_s = window_bounds(cfg)
         series = prom.query_range(CPU_RANGE_QUERY, start_s, end_s)
-        # Each node's windows are judged against that node's own median,
-        # with series from deleted nodes dropped: their history is real but
-        # says nothing about the cluster as it stands, and a steady busy
-        # node pooled with a quiet sibling is two steady nodes, not a burst.
-        # An empty matrix is not smoothed over with the legacy window
-        # average: it means no granular evidence came back, and the
-        # no-data paths below decide.
-        per_node = evaluate_variance_by_node(
-            series,
-            peak_threshold=cfg.cpu_peak_threshold,
-            ratio_threshold=cfg.cpu_variance_ratio,
-            floor=CPU_VARIANCE_FLOOR,
-            baseline_full=cfg.cpu_peak_threshold / 2,
-            live_nodes=live_nodes,
-        )
-        if per_node:
-            stats = summarize_variance(per_node)
+        if series is None:
+            # The read itself failed (request error or non-success status),
+            # unlike an empty result - but a busy instant can still accuse,
+            # so the branches below decide the verdict; only a quiet
+            # no-evidence outcome becomes a failed-read UNKNOWN.
+            read_failed = True
+            entry["reason"] = "range query failed (Prometheus error or timeout)"
+        else:
+            # Each node's windows are judged against that node's own median,
+            # with series from deleted nodes dropped: their history is real but
+            # says nothing about the cluster as it stands, and a steady busy
+            # node pooled with a quiet sibling is two steady nodes, not a burst.
+            # An empty matrix is not smoothed over with the legacy window
+            # average: it means no granular evidence came back, and the
+            # no-data paths below decide.
+            per_node = evaluate_variance_by_node(
+                series,
+                peak_threshold=cfg.cpu_peak_threshold,
+                ratio_threshold=cfg.cpu_variance_ratio,
+                floor=CPU_VARIANCE_FLOOR,
+                baseline_full=cfg.cpu_peak_threshold / 2,
+                live_nodes=live_nodes,
+            )
+            if per_node:
+                stats = summarize_variance(per_node)
 
     active = False
     source = None
@@ -163,13 +172,13 @@ def check_cpu(
         # one quiet sample cannot acquit the window.  The override below
         # lets an instant accuse but never acquit; the no-data path is not
         # looser than that.  UNKNOWN, still counted (bash parity for the
-        # no-instant-at-all case), but declared rather than failed: it does
-        # not count toward the too-many-UNKNOWNs gate.
+        # no-instant-at-all case): a declared no-data verdict when the query
+        # came back empty, a failed read - gate-eligible - when it did not.
         entry["value"] = fmt2(instant_cpu)
         entry["instant"] = instant_cpu
         if instant_cpu is not None:
             entry["source"] = "instant"
-        return CheckOutcome("UNKNOWN", entry, counted=True, no_data=True)
+        return CheckOutcome("UNKNOWN", entry, counted=True, no_data=not read_failed)
 
     # One-directional instant override: a live spike beats an idle verdict.
     instant_override = False
@@ -225,19 +234,28 @@ def check_memory(
     entry: dict[str, Any] = {"result": "UNKNOWN", "value": None, "threshold_ratio": None}
     stats: MemoryStepStats | None = None
     per_node: list[MemoryStepStats] = []
+    read_failed = False
 
     if cfg.time_window_minutes > 0:
         start_s, end_s = window_bounds(cfg)
         series = prom.query_range(MEMORY_RANGE_QUERY, start_s, end_s)
-        # Movement is judged per node and only on live ones, like the CPU
-        # variance rule: a deleted node's refill says nothing about the
-        # cluster as it stands.
-        per_node = evaluate_memory_steps_by_node(
-            series,
-            points_threshold=cfg.memory_variance_points,
-            span_windows=cfg.memory_variance_windows,
-            live_nodes=live_nodes,
-        )
+        if series is None:
+            # The read itself failed, unlike an empty result (see check_cpu):
+            # the branches below still decide - a busy instant can accuse -
+            # and only a quiet no-evidence outcome becomes a failed-read
+            # UNKNOWN, gate-eligible.
+            read_failed = True
+            entry["reason"] = "range query failed (Prometheus error or timeout)"
+        else:
+            # Movement is judged per node and only on live ones, like the CPU
+            # variance rule: a deleted node's refill says nothing about the
+            # cluster as it stands.
+            per_node = evaluate_memory_steps_by_node(
+                series,
+                points_threshold=cfg.memory_variance_points,
+                span_windows=cfg.memory_variance_windows,
+                live_nodes=live_nodes,
+            )
 
     active = False
     source: str | None = None
@@ -258,14 +276,14 @@ def check_memory(
     else:
         # A window was configured but no windowed data came back, and no
         # instant is busy: either no instant at all, or a quiet one, which
-        # cannot acquit the window (see check_cpu).  UNKNOWN, still
-        # counted, but declared rather than failed: it does not count
-        # toward the too-many-UNKNOWNs gate.
+        # cannot acquit the window (see check_cpu).  UNKNOWN, still counted:
+        # a declared no-data verdict when the query came back empty, a
+        # failed read - gate-eligible - when it did not.
         entry["value"] = fmt2(instant_mem)
         entry["instant"] = instant_mem
         if instant_mem is not None:
             entry["source"] = "instant"
-        return CheckOutcome("UNKNOWN", entry, counted=True, no_data=True)
+        return CheckOutcome("UNKNOWN", entry, counted=True, no_data=not read_failed)
 
     # Threshold ratio: the reading closest to firing, as a fraction of the
     # level that fires it - the hottest node's rise against the points

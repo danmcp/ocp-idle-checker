@@ -473,37 +473,37 @@ def test_node_listing_failure_reports_gpu_unknown(monkeypatch, prom_server, tmp_
 def test_too_many_failed_reads_error(monkeypatch, prom_server, tmp_path, capsys):
     # The gate's consequence: too many counted UNKNOWNs from failed reads
     # error out (exit 2) rather than issue a verdict built on too little
-    # data.  Today only a failed node listing produces a gated UNKNOWN (at
-    # most one, under the gate's threshold of two), so the gate is forced
-    # open here by lowering the threshold to zero - the branch must stay
-    # correct for the failed-read sources reason plumbing will add.
+    # data.  The CPU and memory range queries fail for real here (the stub
+    # server 404s them, which the client reads as a failed read, not empty
+    # data), so the gate fires at its shipped threshold of two.
     url, responses = prom_server
     monkeypatch.setenv("OCP_IDLE_PROMETHEUS_URL", url)
-    monkeypatch.setattr(oic.main, "MAX_COUNTED_UNKNOWNS", 0)
     oc_responses = base_oc_responses(
         [node_item("node-1"), node_item("node-2"), node_item("node-3")]
     )
-    oc_responses[("get", "nodes", "-o", "json")] = None
     install_fake_oc(monkeypatch, oc_responses)
-    quiet_cpu(responses, ["node-1", "node-2", "node-3"])
-    quiet_memory_and_api(responses, ["node-1", "node-2", "node-3"])
+    # Only the API criterion gets windowed data; CPU and memory fail.
+    responses[("/api/v1/query", api_avg_query(WINDOW))] = prom_instant_json("5")
+    responses[("/api/v1/query_range", oic.API_RANGE_QUERY)] = prom_range_json(
+        [{"metric": {}, "values": [[i * 900, "5"] for i in range(8)]}]
+    )
 
     json_path = tmp_path / "report.json"
     exit_code = oic.run(["-q", "--json", str(json_path), "-w", str(WINDOW)])
     assert exit_code == 2
     assert capsys.readouterr().out.splitlines() == [
-        "CPU: IDLE",
-        "Memory: IDLE",
+        "CPU: UNKNOWN",
+        "Memory: UNKNOWN",
         "API Server: IDLE",
-        "GPU: UNKNOWN",
+        "GPU: N/A",
         "Operators: IDLE",
-        "STATUS: ERROR (too many UNKNOWN criteria: GPU)",
+        "STATUS: ERROR (too many UNKNOWN criteria: CPU, Memory)",
     ]
 
     report = json.loads(json_path.read_text())
     assert report["status"] == "ERROR"
     assert report["exit_code"] == 2
-    assert report["error"] == "too many UNKNOWN criteria: GPU"
+    assert report["error"] == "too many UNKNOWN criteria: CPU, Memory"
     # No verdict means no boundary criterion and no right-sizing claim.
     assert report["criteria"]["driver"] is None
     assert report["oversized"] == {"result": False, "gpu_peak": None, "nodes": []}
@@ -690,12 +690,15 @@ def test_unknown_votes_depriving_the_quorum_annotate_status(
     )
     oc_responses[("get", "events", "-A", "-o", "json")] = None
     install_fake_oc(monkeypatch, oc_responses)
-    # Only the API criterion has Prometheus data; the server 404s the
-    # CPU/memory queries, which the client reads as no data.
+    # Only the API criterion has windowed data; the CPU and memory range
+    # queries succeed but come back empty (a fresh install, short retention),
+    # which the client reads as no data rather than a failed read.
     responses[("/api/v1/query", api_avg_query(WINDOW))] = prom_instant_json("5")
     responses[("/api/v1/query_range", oic.API_RANGE_QUERY)] = prom_range_json(
         [{"metric": {}, "values": [[i * 900, "5"] for i in range(8)]}]
     )
+    responses[("/api/v1/query_range", oic.CPU_RANGE_QUERY)] = prom_range_json([])
+    responses[("/api/v1/query_range", oic.MEMORY_RANGE_QUERY)] = prom_range_json([])
 
     json_path = tmp_path / "report.json"
     exit_code = oic.run(["-q", "--json", str(json_path), "-w", str(WINDOW)])

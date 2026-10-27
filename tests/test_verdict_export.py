@@ -114,10 +114,10 @@ def test_declared_no_data_unknowns_do_not_trip_the_gate():
     assert oic.counted_unknowns(outcomes) == []
 
 
-def test_no_data_unknown_plus_failed_read_trips_the_gate():
+def test_no_data_unknown_plus_failed_read_counts_only_the_failure():
     # One declared no-data UNKNOWN and one genuine failure (GPU node
     # listing): the failure counts, the declaration does not - one gated
-    # UNKNOWN is survivable.
+    # UNKNOWN is survivable, so the gate stays closed.
     outcomes = [
         outcome("UNKNOWN", no_data=True),  # cpu
         outcome("IDLE"),  # memory
@@ -125,7 +125,9 @@ def test_no_data_unknown_plus_failed_read_trips_the_gate():
         outcome("UNKNOWN"),  # gpu listing failed
         outcome("IDLE"),  # operators
     ]
-    assert oic.counted_unknowns(outcomes) == ["GPU"]
+    unknowns = oic.counted_unknowns(outcomes)
+    assert unknowns == ["GPU"]
+    assert len(unknowns) <= oic.MAX_COUNTED_UNKNOWNS
 
 
 # === THRESHOLD FOCUS ========================================================

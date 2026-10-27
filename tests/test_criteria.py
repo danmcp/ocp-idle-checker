@@ -231,8 +231,41 @@ def test_cpu_no_data_is_unknown_but_counted():
     assert outcome.counted  # bash parity: cpu UNKNOWN still counts in the denominator
 
 
+def test_cpu_failed_range_read_is_counted_unknown_gate_eligible():
+    # None from query_range means the read failed (request error or
+    # non-success status), not an empty result: a failed read with nothing
+    # else to go on is counted without the no_data flag, so it counts
+    # toward the UNKNOWN gate.
+    prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: None})
+    outcome = oic.check_cpu(base_config(), prom, {"node-1"}, None)
+    assert outcome.result == "UNKNOWN"
+    assert outcome.counted
+    assert not outcome.no_data
+    assert outcome.entry["reason"] == "range query failed (Prometheus error or timeout)"
+
+
+def test_cpu_failed_range_read_busy_instant_still_votes_active():
+    # The failed read must not discard the snapshot: a busy instant is
+    # direct evidence of activity whichever way the windowed query went.
+    prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: None})
+    outcome = oic.check_cpu(base_config(), prom, {"node-1"}, 50.0)
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["source"] == "instant"
+    assert outcome.entry["reason"] == "range query failed (Prometheus error or timeout)"
+
+
+def test_cpu_failed_range_read_quiet_instant_is_gated_unknown():
+    # ...and a quiet snapshot cannot acquit the window: with the read
+    # failed, not empty, the UNKNOWN is a failed read, gate-eligible.
+    prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: None})
+    outcome = oic.check_cpu(base_config(), prom, {"node-1"}, 5.0)
+    assert outcome.result == "UNKNOWN"
+    assert outcome.counted
+    assert not outcome.no_data
+
+
 def test_cpu_no_windowed_data_busy_instant_is_active():
-    # Prometheus down for both windowed queries, snapshot busy: direct
+    # The range queries succeed but come back empty; snapshot busy: direct
     # evidence of activity, the direction the override already allows.
     outcome = oic.check_cpu(base_config(), FakeProm(), {"node-1"}, 50.0)
     assert outcome.result == "ACTIVE"
@@ -248,6 +281,7 @@ def test_cpu_no_windowed_data_quiet_instant_is_unknown():
     outcome = oic.check_cpu(base_config(), FakeProm(), {"node-1"}, 5.0)
     assert outcome.result == "UNKNOWN"
     assert outcome.counted
+    assert outcome.no_data  # empty result, not a failed read
     assert outcome.entry["source"] == "instant"
     assert outcome.entry["value"] == "5.00"
 
@@ -445,6 +479,37 @@ def test_memory_instant_only_when_window_zero():
     assert outcome.result == "IDLE"
 
 
+def test_memory_failed_range_read_is_counted_unknown_gate_eligible():
+    # Like the CPU rule: a failed memory range read with nothing else to go
+    # on is a counted UNKNOWN without the no_data flag, gate-eligible.
+    prom = FakeProm(ranges={oic.MEMORY_RANGE_QUERY: None})
+    outcome = oic.check_memory(base_config(), prom, None, {"node-1"})
+    assert outcome.result == "UNKNOWN"
+    assert outcome.counted
+    assert not outcome.no_data
+    assert outcome.entry["reason"] == "range query failed (Prometheus error or timeout)"
+
+
+def test_memory_failed_range_read_busy_instant_still_votes_active():
+    # The failed read must not discard the snapshot: a busy instant is
+    # direct evidence of activity whichever way the windowed query went.
+    prom = FakeProm(ranges={oic.MEMORY_RANGE_QUERY: None})
+    outcome = oic.check_memory(base_config(), prom, 50.0, {"node-1"})
+    assert outcome.result == "ACTIVE"
+    assert outcome.entry["source"] == "instant"
+    assert outcome.entry["reason"] == "range query failed (Prometheus error or timeout)"
+
+
+def test_memory_failed_range_read_quiet_instant_is_gated_unknown():
+    # ...and a quiet snapshot cannot acquit the window: with the read
+    # failed, not empty, the UNKNOWN is a failed read, gate-eligible.
+    prom = FakeProm(ranges={oic.MEMORY_RANGE_QUERY: None})
+    outcome = oic.check_memory(base_config(), prom, 20.0, {"node-1"})
+    assert outcome.result == "UNKNOWN"
+    assert outcome.counted
+    assert not outcome.no_data
+
+
 def test_memory_no_data_is_unknown_but_counted():
     outcome = oic.check_memory(base_config(), FakeProm(), None, {"node-1"})
     assert outcome.result == "UNKNOWN"
@@ -463,6 +528,7 @@ def test_memory_no_windowed_data_quiet_instant_is_unknown():
     outcome = oic.check_memory(base_config(), FakeProm(), 20.0, {"node-1"})
     assert outcome.result == "UNKNOWN"
     assert outcome.counted
+    assert outcome.no_data  # empty result, not a failed read
     assert outcome.entry["source"] == "instant"
     assert outcome.entry["value"] == "20.00"
 

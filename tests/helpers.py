@@ -23,7 +23,7 @@ class FakeProm:
         self,
         instant: dict[str, float | None] | None = None,
         instant_all: dict[str, list[dict]] | None = None,
-        ranges: dict[str, list[dict]] | None = None,
+        ranges: dict[str, list[dict] | None] | None = None,
     ) -> None:
         self.instant = instant or {}
         self.instant_all = instant_all or {}
@@ -44,7 +44,9 @@ class FakeProm:
 
     def query_range(self, promql: str, start_s: int, end_s: int, step_s: int = 900):
         self.range_calls.append(promql)
-        return self.ranges.get(promql)
+        # A missing key is a successful empty query (matching the real
+        # client's []); an explicit None is a failed read.
+        return self.ranges.get(promql, [])
 
 
 def make_range_series(node: str, values: list[str]) -> dict:
