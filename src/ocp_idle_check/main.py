@@ -265,7 +265,3 @@ def run(argv: list[str] | None = None) -> int:
         log_info(f"JSON exported to {cfg.json_path}")
 
     return exit_code
-
-
-if __name__ == "__main__":
-    sys.exit(run())

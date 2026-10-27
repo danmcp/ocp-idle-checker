@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+
 import pytest
 
 import ocp_idle_check as oic
@@ -155,3 +157,41 @@ def test_abbreviations_are_rejected():
     # behavior was equally strict.
     with pytest.raises(SystemExit):
         oic.parse_args(["--win", "60"])
+
+
+def test_module_entry_maps_uncaught_exception_to_exit_2(monkeypatch, capsys):
+    # An uncaught exception's default exit status is 1, which the contract
+    # reads as IDLE; the module entry point must convert it to an error exit.
+    import ocp_idle_check.__main__ as entry
+    import ocp_idle_check.main as main_module
+
+    def boom(argv):
+        raise RuntimeError("kaboom")
+
+    monkeypatch.setattr(main_module, "run", boom)
+    assert entry.main() == 2
+    err = capsys.readouterr().err
+    assert "unexpected failure: RuntimeError: kaboom" in err
+    assert "Traceback" in err
+
+
+def test_module_entry_maps_keyboard_interrupt_to_exit_2(monkeypatch):
+    # Ctrl-C's default exit status is also 1; an interrupted run is an error.
+    import ocp_idle_check.__main__ as entry
+    import ocp_idle_check.main as main_module
+
+    def interrupted(argv):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(main_module, "run", interrupted)
+    assert entry.main() == 2
+
+
+def test_module_entry_maps_import_failure_to_exit_2(monkeypatch, capsys):
+    # The package import runs inside the guarded block, so a broken module
+    # is an error exit, not a traceback exit 1.
+    import ocp_idle_check.__main__ as entry
+
+    monkeypatch.setitem(sys.modules, "ocp_idle_check.main", None)
+    assert entry.main() == 2
+    assert "unexpected failure: ModuleNotFoundError" in capsys.readouterr().err

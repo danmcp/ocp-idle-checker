@@ -1102,6 +1102,37 @@ def test_operators_pod_listing_failure_is_unknown_not_na():
     assert outcome.entry["reason"] == "pod listing failed (oc error or timeout)"
 
 
+def test_operators_malformed_pod_row_is_skipped_with_warning(capsys):
+    # A row with the wrong field count can only mean oc's output format
+    # changed; it is skipped loudly so it cannot read as "no controller pods".
+    oic.set_verbose(True)
+    try:
+        oc = FakeOc(
+            pods=[
+                "only-three\tfields",
+                old_operator_pod(),
+            ]
+        )
+        outcome = oic.check_operators(base_config(), oc, now=NOW)
+    finally:
+        oic.set_verbose(False)
+    assert outcome.result == "IDLE"
+    assert "malformed pod row (2 fields)" in capsys.readouterr().err
+
+
+def test_operators_malformed_rs_row_is_skipped_with_warning(capsys):
+    # A row with the wrong field count can only mean oc's output format
+    # changed; it is skipped loudly and the unit keeps its pod-age fallback.
+    oic.set_verbose(True)
+    try:
+        oc = FakeOc(pods=[old_operator_pod()], replicasets=["one\ttwo"])
+        outcome = oic.check_operators(base_config(), oc, now=NOW)
+    finally:
+        oic.set_verbose(False)
+    assert outcome.result == "IDLE"
+    assert "malformed ReplicaSet row (2 fields)" in capsys.readouterr().err
+
+
 def test_operators_event_listing_failure_is_unknown_not_idle():
     # Zero events on a failed listing would vote IDLE for old, unverified
     # operators; the criterion goes UNKNOWN instead.

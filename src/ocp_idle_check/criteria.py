@@ -25,6 +25,7 @@ from .config import (
     VARIANCE_SOURCE,
     Config,
 )
+from .log import log_warn
 from .memory_steps import (
     MemoryStepStats,
     _memory_steps_entry,
@@ -496,6 +497,9 @@ def check_operators(cfg: Config, oc: Oc, now: datetime | None = None) -> CheckOu
     for line in pods:
         fields = line.split("\t")
         if len(fields) != 5:
+            # Unreachable unless oc's jsonpath output changes shape; without
+            # the warning it would read as "no controller pods".
+            log_warn(f"skipping malformed pod row ({len(fields)} fields): {line!r}")
             continue
         namespace, pod, owner_kind, owner_name, created_raw = fields
         if not in_scope(namespace) or not POD_RE.search(pod):
@@ -531,6 +535,9 @@ def check_operators(cfg: Config, oc: Oc, now: datetime | None = None) -> CheckOu
         for line in rs_rows:
             fields = line.split("\t")
             if len(fields) != 3:
+                # Unreachable unless oc's jsonpath output changes shape; the
+                # unit keeps its pod-age fallback rather than failing loudly.
+                log_warn(f"skipping malformed ReplicaSet row ({len(fields)} fields): {line!r}")
                 continue
             rs_created = parse_k8s_timestamp(fields[2])
             if rs_created is None:
