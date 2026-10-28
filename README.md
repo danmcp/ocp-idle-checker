@@ -33,9 +33,9 @@ Each criterion is evaluated independently and can be `IDLE`, `ACTIVE`, `UNKNOWN`
 
 | Criterion | Votes ACTIVE when |
 |-----------|-------------------|
-| **CPU** | any node's 15-minute window > 30% (all 15-min windows from each node's total window (default: 7 days) are considered), or any node bursting well above its own median (10× at a 1% median, easing to 2× at 15%; 1% floor on a zero median); an instant `oc adm top nodes` reading ≥ 15% can also flip an otherwise-IDLE result; with no windowed data at all, a busy instant votes ACTIVE but a quiet one reads UNKNOWN |
+| **CPU** | any node's 15-minute window > 30% (all 15-min windows from each node's total window (default: 7 days) are considered), or any node bursting well above its own median (10× at a 0.2% median, easing to 1.2× at 25%; 1% floor on a zero median); an instant `oc adm top nodes` reading ≥ 15% can also flip an otherwise-IDLE result; with no windowed data at all, a busy instant votes ACTIVE but a quiet one reads UNKNOWN |
 | **Memory** | any live node's windowed memory rises more than 10 percentage points between two windows up to 4 consecutive 15-minute windows apart (2 windows are enough — the 4 is a max span, not a required count); with no windowed data at all, a busy instant votes ACTIVE but a quiet one reads UNKNOWN |
-| **API Server** | the time-windowed average ≥ 100 req/sec, or any 15-minute window bursting well above the median (10× at a 1 req/s median, easing to 2× at 50 req/s) |
+| **API Server** | the time-windowed average ≥ 100 req/sec, or any 15-minute window bursting well above the median (10× at a 0.2 req/s median, easing to 1.2× at ~83.3 req/s) |
 | **GPU** | any node's 15-minute window > 40%, or any node bursting well above its own median (DCGM GPU utilization; 5% floor on a zero median) |
 | **Operators** | the median controller age is < 7 days, or ≥ 5 reconciliation events in the last 48 hours |
 
@@ -60,16 +60,18 @@ The CPU and GPU criteria judge **each node against its own history** instead of 
 - **Peak rule**: any node's 15-minute window averaged above the peak threshold (30% for CPU, 40% for GPU), **or**
 - **Variance rule**: a node jumped well above its own median — a burst.
 
-How big the jump must be depends on how quiet the node usually is: **10× the node's median when the median is 1**, easing to **2× at half the criterion's absolute threshold** — 15% for CPU, 20% for GPU, 50 req/s for the API server (the same rule in each metric's own unit). The idea: a node idling at 1% that jumps to 11% is activity; a node sitting steadily at 15% is not. At half the threshold the required jump equals the threshold itself (2 × 15% = 30%, 2 × 20% = 40%, 2 × 50 req/s = 100 req/s), so above that point the simpler peak rule takes over:
+How big the jump must be depends on how quiet the node usually is: **10× the node's median when the median is 0.2**, easing along a power law to **1.2× at the handoff — the criterion's absolute threshold divided by 1.2** — 25% for CPU, ~33.3% for GPU, ~83.3 req/s for the API server (the same rule in each metric's own unit). The idea: a node idling at 1% that jumps to 5% is activity; a node sitting steadily at 15% is not. The handoff is exact by construction: at a baseline of the threshold ÷ 1.2 the required peak is 1.2 × (threshold ÷ 1.2) = the threshold itself, so precisely there the simpler peak rule takes over (past it the curve keeps easing, but the peak rule owns those baselines anyway):
 
 | series median | CPU multiple → required peak (%) | GPU multiple → required peak (%) | API multiple → required peak (req/s) |
 |---|---|---|---|
 | 0 | — | — | — |
-| 1 | 10× → 10 | 10× → 10 | 10× → 10 |
-| 2 | 6.6× → 13.2 | 6.9× → 13.8 | 7.5× → 15.0 |
-| 5 | 3.8× → 19.2 | 4.2× → 21.1 | 5.2× → 25.8 |
-| 10 | 2.5× → 25.4 | 2.9× → 29.0 | 3.9× → 38.8 |
-| at the 2× point (CPU 15 / GPU 20 / API 50) | 2× → 30 = peak threshold | 2× → 40 = peak threshold | 2× → 100 = request threshold |
+| 0.2 | 10× → 2 | 10× → 2 | 10× → 2 |
+| 1 | 4.9× → 4.9 | 5.1× → 5.1 | 5.7× → 5.7 |
+| 2 | 3.6× → 7.3 | 3.9× → 7.7 | 4.5× → 8.9 |
+| 5 | 2.4× → 12.2 | 2.6× → 13.2 | 3.2× → 16.1 |
+| 10 | 1.8× → 17.9 | 2.0× → 19.8 | 2.5× → 25.3 |
+| 15 | 1.5× → 22.5 | 1.7× → 25.1 | 2.2× → 32.9 |
+| at the handoff (CPU 25 / GPU 33.3 / API 83.3) | 1.2× → 30 = peak threshold | 1.2× → 40 = peak threshold | 1.2× → 100 = request threshold |
 
 On a zero median the floor is the whole requirement: 1% for CPU, 5% for GPU, and none for the API rule — any positive request rate fires. The GPU floor sits just over DCGM's 1–4% idle noise (background kernel and health-probe blips, not real use), so an untouched card stays idle while a real burst over zero fires. (Memory is not in this table on purpose — it is judged by rise in percentage points, not by the variance curve; see [Memory Movement](#memory-movement).)
 
@@ -77,7 +79,7 @@ An instant `oc adm top nodes` reading above 15% can still flip an otherwise-IDLE
 
 ### Variance Detection (API Server)
 
-The API server criterion keeps the legacy window-average threshold (100 req/sec) and adds a burst detector with the same shape in req/s: 10× the median at a 1 req/s median, easing to 2× at 50 req/s, no floor. There is no peak branch; the windowed average covers the high end — a median above ~200 req/s implies an average over the request threshold.
+The API server criterion keeps the legacy window-average threshold (100 req/sec) and adds a burst detector with the same shape in req/s: 10× the median at a 0.2 req/s median, easing to 1.2× at ~83.3 req/s (the request threshold ÷ 1.2), no floor. There is no peak branch; the windowed average covers the high end — a median above ~83 req/s implies an average over the request threshold.
 
 ### Operators
 
@@ -162,10 +164,10 @@ Edge cases: UNKNOWN and N/A criteria carry no ratio (`null`); the floorless zero
 | `--operator-exclude-prefixes PREFIX,...` | Namespace prefixes excluded from the operator scan | openshift-,kube-,open-cluster-management- |
 | `--operator-event-hours HOURS` | Reconciliation event window for the operators criterion | 48 |
 | `--cpu-peak-threshold N` | CPU: any 15-min window above this % = ACTIVE | 30 |
-| `--cpu-variance-ratio N` | CPU: burst multiple the peak must clear at half the peak threshold (15%); quieter baselines require more | 2 |
+| `--cpu-variance-ratio N` | CPU: burst multiple the peak must clear at the handoff (peak threshold ÷ ratio = 25%); quieter baselines require more | 1.2 |
 | `--gpu-peak-threshold N` | GPU: any 15-min window above this % = ACTIVE | 40 |
-| `--gpu-variance-ratio N` | GPU: burst multiple the peak must clear at half the peak threshold (20%); quieter baselines require more | 2 |
-| `--api-variance-ratio N` | API: burst multiple the peak must clear at a baseline of 50 req/s; quieter baselines require more | 2 |
+| `--gpu-variance-ratio N` | GPU: burst multiple the peak must clear at the handoff (peak threshold ÷ ratio = ~33.3%); quieter baselines require more | 1.2 |
+| `--api-variance-ratio N` | API: burst multiple the peak must clear at the handoff (request threshold ÷ ratio = ~83.3 req/s); quieter baselines require more | 1.2 |
 | `--csv FILE` | Export to CSV | - |
 | `--json FILE` | Export to JSON | - |
 | `--token TOKEN` | Prometheus bearer token (resolved via `oc` when omitted) | - |

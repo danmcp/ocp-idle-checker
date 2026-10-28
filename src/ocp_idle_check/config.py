@@ -25,12 +25,12 @@ ML_NODE_PATTERN = "p5|p4d|g5"
 
 # Variance rule defaults - fleet-calibration knobs, ideal values TBD.
 CPU_PEAK_THRESHOLD = 30.0  # percent; any 15-min window above this = ACTIVE
-CPU_VARIANCE_RATIO = 2.0  # burst multiple required at half the peak threshold
+CPU_VARIANCE_RATIO = 1.2  # burst multiple required at the handoff (peak threshold / ratio)
 CPU_VARIANCE_FLOOR = 1.0  # percent; minimum peak the burst rule demands on a zero baseline
 GPU_PEAK_THRESHOLD = 40.0
-GPU_VARIANCE_RATIO = 2.0  # burst multiple required at half the peak threshold
+GPU_VARIANCE_RATIO = 1.2  # burst multiple required at the handoff (peak threshold / ratio)
 GPU_VARIANCE_FLOOR = 5.0  # percent; DCGM's idle noise tail reads 1-4% on a GPU doing nothing
-API_VARIANCE_RATIO = 2.0  # burst multiple required at a baseline of 50 req/s
+API_VARIANCE_RATIO = 1.2  # burst multiple required at the handoff (100 req/s / ratio = 83.3)
 
 # Memory movement rule - see check_memory.  Absolute percentage points of
 # rise between window averages, not the shared ratio law: a fixed
@@ -40,20 +40,22 @@ MEMORY_VARIANCE_POINTS = 10.0  # points of rise within the span = ACTIVE
 MEMORY_VARIANCE_WINDOWS = 4  # consecutive 15-min windows a rise may span (2 are needed at a min to perform the calculation)
 
 # The shared variance law, in each criterion's native unit: the required
-# multiple is 5x the ratio at a baseline of 1 (10x with the default 2x ratio)
-# and falls to the ratio at baseline_full - half the criterion's absolute
-# threshold (15% CPU, 20% GPU, 50 req/s API) - following a power law in
-# between, and stops there: past baseline_full the multiple is clamped at the
-# ratio, so a flat series well above it never reads as a burst.  The clamp
-# lands exactly where the two branches meet: at baseline_full the required
-# peak is 2x baseline_full = the absolute threshold, so the variance rule
-# owns everything below half the threshold and the absolute branch (window
-# peak over the peak threshold, API windowed average over the request
-# threshold) everything above.  A floor - the CPU/GPU constants above; the
-# API rule has none - is the minimum required peak and stands in for the
-# whole curve on a zero baseline.
-VARIANCE_ANCHOR_MULTIPLE = 10.0  # required multiple at a baseline of 1
-VARIANCE_DEFAULT_BASELINE_FULL = 50.0  # the API criterion's clamp point
+# multiple is 10x at a baseline of 0.2 (VARIANCE_ANCHOR_*) and falls to the
+# ratio at baseline_full - the criterion's absolute threshold divided by
+# the ratio (25% CPU, ~33.3% GPU, ~83.3 req/s API at the default 1.2) -
+# following a power law in between, so quiet baselines need proportionally
+# bigger bursts before they count as bursty.  The handoff is exact by
+# construction: at baseline_full the required peak is
+# ratio x threshold/ratio = the threshold itself, so the variance branch
+# hands the verdict to the absolute branch (window peak over the peak
+# threshold, API windowed average over the request threshold) precisely
+# there.  Past the handoff the power law keeps easing the multiple below
+# the ratio; the absolute branch owns those peaks anyway.  A floor - the
+# CPU/GPU constants above; the API rule has none - is the minimum required
+# peak and stands in for the whole curve on a zero baseline.
+VARIANCE_ANCHOR_MULTIPLE = 10.0  # required multiple at VARIANCE_ANCHOR_BASELINE
+VARIANCE_ANCHOR_BASELINE = 0.2  # the curve's quiet-end anchor point
+VARIANCE_DEFAULT_BASELINE_FULL = 100.0 / 1.2  # the API criterion's handoff point
 
 VARIANCE_WINDOW_MINUTES = 15  # the "15 min period" of the variance rule
 STEP_SECONDS = 900  # query_range step: one point per 15-min window
@@ -245,7 +247,7 @@ def parse_args(argv: list[str] | None = None) -> Config:
         type=float,
         default=CPU_VARIANCE_RATIO,
         metavar="N",
-        help="CPU variance rule: burst multiple the peak must clear at half the peak threshold (15%%); quieter baselines require more (default: %(default)s)",
+        help="CPU variance rule: burst multiple the peak must clear at the handoff (peak threshold / ratio = 25%%); quieter baselines require more (default: %(default)s)",
     )
     parser.add_argument(
         "--gpu-peak-threshold",
@@ -259,14 +261,14 @@ def parse_args(argv: list[str] | None = None) -> Config:
         type=float,
         default=GPU_VARIANCE_RATIO,
         metavar="N",
-        help="GPU variance rule: burst multiple the peak must clear at half the peak threshold (20%%); quieter baselines require more (default: %(default)s)",
+        help="GPU variance rule: burst multiple the peak must clear at the handoff (peak threshold / ratio = ~33%%); quieter baselines require more (default: %(default)s)",
     )
     parser.add_argument(
         "--api-variance-ratio",
         type=float,
         default=API_VARIANCE_RATIO,
         metavar="N",
-        help="API variance rule: burst multiple the peak must clear at a baseline of 50 req/s; quieter baselines require more (default: %(default)s)",
+        help="API variance rule: burst multiple the peak must clear at the handoff (100 req/s / ratio = ~83 req/s); quieter baselines require more (default: %(default)s)",
     )
     parser.add_argument(
         "--memory-variance-points",

@@ -260,7 +260,7 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
     ]
     assert (criteria["total"], criteria["met"], criteria["threshold"]) == (4, 4, 3)
     assert criteria["cpu"]["result"] == "IDLE"
-    assert criteria["cpu"]["threshold_ratio"] == 0.15
+    assert criteria["cpu"]["threshold_ratio"] == 0.27
     assert criteria["operators"]["age_days"] == 12.0
     assert criteria["operators"]["events"] == 0
     assert criteria["gpu"]["result"] == "N/A"
@@ -308,7 +308,7 @@ def test_active_cluster_quiet(monkeypatch, prom_server, tmp_path, capsys):
         "GPU: N/A",
         "Operators: ACTIVE",
         "Oversized: true (2 level-idle nodes)",
-        "STATUS: ACTIVE (Operators at 350% of threshold)",
+        "STATUS: ACTIVE (CPU at 411% of threshold)",
     ]
 
     report = json.loads(json_path.read_text())
@@ -413,7 +413,7 @@ def test_operator_listing_failure_reports_unknown(monkeypatch, prom_server, tmp_
         "API Server: IDLE",
         "GPU: N/A",
         "Operators: UNKNOWN",
-        "STATUS: IDLE (closest to active: API Server at 19% of threshold)",
+        "STATUS: IDLE (closest to active: API Server at 31% of threshold)",
     ]
 
     report = json.loads(json_path.read_text())
@@ -709,7 +709,7 @@ def test_unknown_votes_depriving_the_quorum_annotate_status(
         "API Server: IDLE",
         "GPU: N/A",
         "Operators: UNKNOWN",
-        "STATUS: ACTIVE (UNKNOWN-driven; API Server at 19% of threshold)",
+        "STATUS: ACTIVE (UNKNOWN-driven; API Server at 31% of threshold)",
     ]
 
     criteria = json.loads(json_path.read_text())["criteria"]
@@ -720,7 +720,7 @@ def test_unknown_votes_depriving_the_quorum_annotate_status(
     assert criteria["driver"] == {
         "criterion": "api_server",
         "label": "API Server",
-        "threshold_ratio": 0.19,
+        "threshold_ratio": 0.31,
         "quorum_driven": True,
     }
     # Nothing fired, so the ACTIVE verdict carries no right-sizing claim -

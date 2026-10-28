@@ -52,23 +52,24 @@ def test_cpu_active_on_peak():
     entry = outcome.entry
     assert entry["peak"] == 45.0
     assert entry["peak_exceeded"] is True
-    assert entry["variance_exceeded"] is False
+    assert entry["variance_exceeded"] is True  # 45 also clears the required 12.2
     assert entry["value"] == "45.00"
     assert entry["source"] == "variance over 15m windows"
 
 
 def test_cpu_active_on_variance_ratio():
     # Median 5%, peak 28%: no window crossed the peak threshold, but the
-    # peak clears the required 19.2% (a 3.8x multiple) the curve demands
-    # at a median of 5 with the 2x point at 15% (half the peak threshold).
+    # peak clears the required 12.2% (a 2.4x multiple) the curve demands
+    # at a median of 5 with the 1.2x handoff at 25% (the peak threshold
+    # divided by the ratio).
     prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["5", "5", "28"])]})
     outcome = oic.check_cpu(base_config(), prom, {"node-1"}, None)
     assert outcome.result == "ACTIVE"
     assert outcome.entry["peak_exceeded"] is False
     assert outcome.entry["variance_exceeded"] is True
     assert outcome.entry["ratio"] == 5.6
-    assert outcome.entry["required_ratio"] == pytest.approx(3.84, abs=0.01)
-    assert outcome.entry["required_peak"] == pytest.approx(19.21, abs=0.01)
+    assert outcome.entry["required_ratio"] == pytest.approx(2.43, abs=0.01)
+    assert outcome.entry["required_peak"] == pytest.approx(12.16, abs=0.01)
 
 
 def test_cpu_quiet_cluster_is_idle():
@@ -90,13 +91,13 @@ def test_cpu_quiet_cluster_is_idle():
 
 def test_cpu_small_burst_on_quiet_median_is_active():
     # Median 2%, peak 16%: the motivating pattern - a bursty workload on a
-    # quiet node is active.  The required peak at a 2% median is 15.0%
-    # (a 7.5x multiple), so a 5x burst to 10% stays idle while 16% fires.
+    # quiet node is active.  The required peak at a 2% median is 7.3%
+    # (a ~3.6x multiple), so a 3.5x burst to 7% stays idle while 16% fires.
     prom = FakeProm(
         ranges={
             oic.CPU_RANGE_QUERY: [
                 make_range_series("node-1", ["2", "2", "16"]),
-                make_range_series("node-2", ["2", "2", "10"]),
+                make_range_series("node-2", ["2", "2", "7"]),
             ]
         }
     )
@@ -104,14 +105,14 @@ def test_cpu_small_burst_on_quiet_median_is_active():
     assert outcome.result == "ACTIVE"
     assert outcome.entry["peak_exceeded"] is False
     assert outcome.entry["variance_exceeded"] is True
-    assert outcome.entry["required_peak"] == pytest.approx(13.25, abs=0.01)
+    assert outcome.entry["required_peak"] == pytest.approx(7.28, abs=0.01)
     per_node = {e["node"]: e for e in outcome.entry["per_node"]}
     assert per_node["node-1"]["variance_exceeded"] is True
     assert per_node["node-2"]["variance_exceeded"] is False
 
 
 def test_cpu_large_burst_on_quiet_median_is_active():
-    # Median 2%, peak 20%: 10x clears the 7.5x requirement.
+    # Median 2%, peak 20%: 10x clears the ~3.6x requirement.
     prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["2", "2", "20"])]})
     outcome = oic.check_cpu(base_config(), prom, {"node-1"}, 2.0)
     assert outcome.result == "ACTIVE"
@@ -562,7 +563,7 @@ def test_api_quiet_is_idle():
 
 def test_api_variance_detector_marks_active():
     # Average 5 req/s is far below 100, but a 15-minute window hit 100 req/s:
-    # 10x the median, clearing the required 38.8 (a 3.9x multiple) the
+    # 10x the median, clearing the required 25.3 (a 2.5x multiple) the
     # curve demands at a median of 10.
     prom = FakeProm(
         instant={api_avg_query(WINDOW): 5.0},
@@ -577,30 +578,30 @@ def test_api_variance_detector_marks_active():
     assert outcome.entry["variance_active"] is True
     assert outcome.entry["variance_peak"] == 100.0
     assert outcome.entry["variance_ratio"] == 10.0
-    assert outcome.entry["variance_required_ratio"] == pytest.approx(3.88, abs=0.01)
-    assert outcome.entry["variance_required_peak"] == pytest.approx(38.78, abs=0.01)
+    assert outcome.entry["variance_required_ratio"] == pytest.approx(2.53, abs=0.01)
+    assert outcome.entry["variance_required_peak"] == pytest.approx(25.28, abs=0.01)
 
 
 def test_api_variance_on_quiet_median_needs_a_bigger_burst():
-    # Median 25 req/s: the curve demands 66.5 req/s (~2.7x), so a burst to
-    # 55 is not variance, while a burst to 70 is.
+    # Median 25 req/s: the curve demands 45.8 req/s (~1.8x), so a burst to
+    # 45 is not variance, while a burst to 46 is.
     quiet = FakeProm(
         instant={api_avg_query(WINDOW): 25.0},
         ranges={
             oic.API_RANGE_QUERY: [
-                {"metric": {}, "values": [[i * 900, v] for i, v in enumerate(["25", "25", "55"])]}
+                {"metric": {}, "values": [[i * 900, v] for i, v in enumerate(["25", "25", "45"])]}
             ]
         },
     )
     outcome = oic.check_api(base_config(), quiet)
     assert outcome.result == "IDLE"
     assert outcome.entry["variance_active"] is False
-    assert outcome.entry["variance_required_ratio"] == pytest.approx(2.66, abs=0.01)
+    assert outcome.entry["variance_required_ratio"] == pytest.approx(1.83, abs=0.01)
     loud = FakeProm(
         instant={api_avg_query(WINDOW): 25.0},
         ranges={
             oic.API_RANGE_QUERY: [
-                {"metric": {}, "values": [[i * 900, v] for i, v in enumerate(["25", "25", "70"])]}
+                {"metric": {}, "values": [[i * 900, v] for i, v in enumerate(["25", "25", "46"])]}
             ]
         },
     )
@@ -610,9 +611,8 @@ def test_api_variance_on_quiet_median_needs_a_bigger_burst():
 
 
 def test_api_steady_load_stays_idle():
-    # Peak 80 is only 1x the median: past the baseline-of-full the required
-    # multiple is clamped at the ratio, so the curve demands 160 req/s at a
-    # median of 80, and the 80 req/s average is below the 100 threshold.
+    # Peak 80 is only 1x the median: at a median of 80 the curve demands
+    # ~97 req/s, and the 80 req/s average is below the 100 threshold.
     prom = FakeProm(
         instant={api_avg_query(WINDOW): 80.0},
         ranges={
@@ -625,9 +625,9 @@ def test_api_steady_load_stays_idle():
 
 def test_api_steady_load_below_a_raised_threshold_stays_idle():
     # The -a 500 scenario: a flat 400 req/s series sits below a raised
-    # request threshold, and the clamped curve demands 2x the median (800
-    # req/s), so steady load must not read as a burst.  Unclamped, the law
-    # would demand ~339 req/s and flag the series ACTIVE.
+    # request threshold, and the handoff scales with it (500/1.2 ~ 416.7),
+    # so the curve demands ~485 req/s at a median of 400 and steady load
+    # does not read as a burst.
     prom = FakeProm(
         instant={api_avg_query(WINDOW): 400.0},
         ranges={
@@ -637,7 +637,7 @@ def test_api_steady_load_below_a_raised_threshold_stays_idle():
     outcome = oic.check_api(base_config(api_threshold=500.0), prom)
     assert outcome.result == "IDLE"
     assert outcome.entry["variance_active"] is False
-    assert outcome.entry["variance_required_peak"] == pytest.approx(800.0)
+    assert outcome.entry["variance_required_peak"] == pytest.approx(485.47, abs=0.01)
 
 
 def test_api_variance_active_without_average():
@@ -783,7 +783,7 @@ def test_gpu_deleted_node_samples_still_vote():
 
 def test_gpu_aggregate_fallback():
     # No query_range matrix: whole-window max/avg aggregates decide.  Peak
-    # 30 over a 4% average clears the required 22.6% the curve demands
+    # 30 over a 4% average clears the required 12.7% the curve demands
     # at that baseline.
     prom = FakeProm(
         instant_all={
@@ -803,8 +803,8 @@ def test_gpu_aggregate_fallback():
     assert outcome.entry["peak"] == 30.0
     assert outcome.entry["baseline"] == 4.0  # mean of the per-series averages
     assert outcome.entry["ratio"] == 7.5  # 30/4, rounded as exported
-    assert outcome.entry["required_ratio"] == pytest.approx(4.75, abs=0.01)
-    assert outcome.entry["required_peak"] == pytest.approx(18.99, abs=0.01)
+    assert outcome.entry["required_ratio"] == pytest.approx(2.89, abs=0.01)
+    assert outcome.entry["required_peak"] == pytest.approx(11.56, abs=0.01)
 
 
 def test_gpu_aggregate_fallback_quiet():
@@ -1276,14 +1276,14 @@ def test_cpu_threshold_ratio_variance_branch():
     prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["5", "5", "28"])]})
     outcome = oic.check_cpu(base_config(), prom, {"node-1"}, None)
     assert outcome.result == "ACTIVE"
-    assert outcome.entry["threshold_ratio"] == pytest.approx(1.46, abs=0.01)
+    assert outcome.entry["threshold_ratio"] == pytest.approx(2.3, abs=0.01)
 
 
 def test_cpu_threshold_ratio_idle_below_one():
     prom = FakeProm(ranges={oic.CPU_RANGE_QUERY: [make_range_series("node-1", ["8", "8", "10"])]})
     outcome = oic.check_cpu(base_config(), prom, {"node-1"}, 2.0)
     assert outcome.result == "IDLE"
-    assert outcome.entry["threshold_ratio"] == pytest.approx(0.43, abs=0.01)
+    assert outcome.entry["threshold_ratio"] == pytest.approx(0.63, abs=0.01)
 
 
 def test_cpu_threshold_ratio_instant_accuses():
@@ -1317,7 +1317,7 @@ def test_cpu_threshold_ratio_max_across_nodes():
     )
     outcome = oic.check_cpu(base_config(), prom, {"node-1", "node-2"}, 2.0)
     assert outcome.result == "ACTIVE"
-    assert outcome.entry["threshold_ratio"] == pytest.approx(1.21, abs=0.01)
+    assert outcome.entry["threshold_ratio"] == pytest.approx(2.2, abs=0.01)
 
 
 def test_memory_threshold_ratio_variance_branch():
@@ -1343,7 +1343,7 @@ def test_api_threshold_ratio_variance_branch():
     )
     outcome = oic.check_api(base_config(), prom)
     assert outcome.result == "ACTIVE"
-    assert outcome.entry["threshold_ratio"] == pytest.approx(2.58, abs=0.01)
+    assert outcome.entry["threshold_ratio"] == pytest.approx(3.96, abs=0.01)
 
 
 def test_api_threshold_ratio_zero_baseline_is_infinite():
@@ -1364,7 +1364,7 @@ def test_gpu_threshold_ratio():
     prom = FakeProm(ranges={oic.GPU_RANGE_QUERY: [make_dcgm_series(["5", "5", "50"])]})
     outcome = oic.check_gpu(base_config(), prom, [gpu_node()])
     assert outcome.result == "ACTIVE"
-    assert outcome.entry["threshold_ratio"] == pytest.approx(2.37, abs=0.01)
+    assert outcome.entry["threshold_ratio"] == pytest.approx(3.79, abs=0.01)
 
 
 def test_gpu_threshold_ratio_na_is_none():

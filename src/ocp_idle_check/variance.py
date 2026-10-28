@@ -7,7 +7,11 @@ import statistics
 from dataclasses import dataclass
 from typing import Any
 
-from .config import VARIANCE_ANCHOR_MULTIPLE, VARIANCE_DEFAULT_BASELINE_FULL
+from .config import (
+    VARIANCE_ANCHOR_BASELINE,
+    VARIANCE_ANCHOR_MULTIPLE,
+    VARIANCE_DEFAULT_BASELINE_FULL,
+)
 from .nodes import _round2
 from .prometheus import _series_node, _to_floats
 
@@ -37,8 +41,11 @@ class VarianceStats:
 
 def variance_curve_exponent(baseline_full: float, ratio_threshold: float) -> float:
     """Power-law exponent placing the curve at 10x (VARIANCE_ANCHOR_MULTIPLE)
-    at a baseline of 1 and ratio_threshold at baseline_full."""
-    return math.log(VARIANCE_ANCHOR_MULTIPLE / ratio_threshold) / math.log(baseline_full)
+    at a baseline of 0.2 (VARIANCE_ANCHOR_BASELINE) and ratio_threshold at
+    baseline_full."""
+    return math.log(VARIANCE_ANCHOR_MULTIPLE / ratio_threshold) / math.log(
+        baseline_full / VARIANCE_ANCHOR_BASELINE
+    )
 
 
 def variance_required_peak(
@@ -51,33 +58,28 @@ def variance_required_peak(
 
     One law shared by CPU, GPU, and the API server, in each criterion's
     native unit (percent for CPU/GPU, req/s for the API server): the
-    required multiple is 5x ratio_threshold at a baseline of 1 (10x with
-    the default 2x) and falls to ratio_threshold at `baseline_full` -
-    half the criterion's absolute threshold (15% CPU, 20% GPU, 50 req/s
-    API) - following a power law in between, so quiet baselines need
-    proportionally bigger bursts before they count as bursty.  At and
-    past baseline_full the multiple is clamped at ratio_threshold:
-    without the clamp the power law keeps relaxing, and a perfectly flat
-    series well above baseline_full reads as a burst (a flat 400 req/s
-    API series demanded a 340 peak).  The clamp is where the two
-    branches meet - at baseline_full the required peak is
-    ratio_threshold x baseline_full = the absolute threshold - so the
-    variance rule governs below half the threshold and the absolute
-    branch above it.  `floor` is the minimum required peak and stands in
-    for the whole curve on a zero baseline: the CPU (1%) and GPU (5%)
-    rules pass one so DCGM's 1-4% idle noise tail over a zero median
-    does not read as an unbounded burst, while the API rule passes none
-    - a zero baseline there demands only a positive peak.
+    required multiple is 10x (VARIANCE_ANCHOR_MULTIPLE) at a baseline of
+    0.2 (VARIANCE_ANCHOR_BASELINE) and falls to ratio_threshold at
+    `baseline_full` - the criterion's absolute threshold divided by the
+    ratio (25% CPU, ~33.3% GPU, ~83.3 req/s API at the default 1.2) -
+    following a power law in between, so quiet baselines need
+    proportionally bigger bursts before they count as bursty.  The
+    handoff to the absolute branch (window peak over the peak threshold,
+    API windowed average over the request threshold) is exact by
+    construction: at baseline_full the required peak is
+    ratio x threshold/ratio = the threshold itself.  Past baseline_full
+    the power law keeps easing the multiple below the ratio; the
+    absolute branch owns those peaks anyway.  `floor` is the minimum
+    required peak and stands in for the whole curve on a zero baseline:
+    the CPU (1%) and GPU (5%) rules pass one so DCGM's 1-4% idle noise
+    tail over a zero median does not read as an unbounded burst, while
+    the API rule passes none - a zero baseline there demands only a
+    positive peak.
     """
     if baseline <= 0:
         return floor
-    # Past baseline_full the power law would keep relaxing the required
-    # multiple below the ratio; it is clamped there - never below it - so
-    # a flat series above baseline_full never reads as a burst.
-    multiple = max(
-        ratio_threshold,
-        ratio_threshold
-        * (baseline_full / baseline) ** variance_curve_exponent(baseline_full, ratio_threshold),
+    multiple = ratio_threshold * (baseline_full / baseline) ** variance_curve_exponent(
+        baseline_full, ratio_threshold
     )
     return max(floor, multiple * baseline)
 

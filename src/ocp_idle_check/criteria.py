@@ -144,7 +144,7 @@ def check_cpu(
                 peak_threshold=cfg.cpu_peak_threshold,
                 ratio_threshold=cfg.cpu_variance_ratio,
                 floor=CPU_VARIANCE_FLOOR,
-                baseline_full=cfg.cpu_peak_threshold / 2,
+                baseline_full=cfg.cpu_peak_threshold / cfg.cpu_variance_ratio,
                 live_nodes=live_nodes,
             )
             if per_node:
@@ -321,7 +321,7 @@ def check_api(cfg: Config, prom: PrometheusClient) -> CheckOutcome:
             stats = evaluate_variance(
                 variance_points,
                 ratio_threshold=cfg.api_variance_ratio,
-                baseline_full=cfg.api_threshold / 2,
+                baseline_full=cfg.api_threshold / cfg.api_variance_ratio,
             )
     else:
         avg = prom.query(API_SHORT_RATE_QUERY)
@@ -373,7 +373,7 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode] | No
         peak_threshold=cfg.gpu_peak_threshold,
         ratio_threshold=cfg.gpu_variance_ratio,
         floor=GPU_VARIANCE_FLOOR,
-        baseline_full=cfg.gpu_peak_threshold / 2,
+        baseline_full=cfg.gpu_peak_threshold / cfg.gpu_variance_ratio,
     )
 
     stats: VarianceStats | None = None
@@ -392,7 +392,10 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode] | No
             baseline = sum(avgs) / len(avgs) if avgs else 0.0
             ratio = peak / baseline if baseline > 0 else None
             required_peak = variance_required_peak(
-                baseline, cfg.gpu_variance_ratio, GPU_VARIANCE_FLOOR, cfg.gpu_peak_threshold / 2
+                baseline,
+                cfg.gpu_variance_ratio,
+                GPU_VARIANCE_FLOOR,
+                cfg.gpu_peak_threshold / cfg.gpu_variance_ratio,
             )
             stats = VarianceStats(
                 points=len(peaks) + len(avgs),
