@@ -24,6 +24,7 @@ from .config import (
     POD_RE,
     VARIANCE_SOURCE,
     Config,
+    cpu_peak_threshold,
 )
 from .log import log_warn
 from .memory_steps import (
@@ -111,6 +112,7 @@ def check_cpu(
     prom: PrometheusClient,
     live_nodes: set[str] | None,
     instant_cpu: float | None,
+    node_cores: dict[str, float] | None = None,
 ) -> CheckOutcome:
     """CPU criterion: variance rule on 15-minute windows, with the
     one-directional instant override.  An unavailable range matrix is not
@@ -132,13 +134,15 @@ def check_cpu(
             read_failed = True
             entry["reason"] = "range query failed (Prometheus error or timeout)"
         else:
-            # Each node's windows are judged against that node's own median,
+            # Each node's windows are judged against that node's own trough,
             # with series from deleted nodes dropped: their history is real but
             # says nothing about the cluster as it stands, and a steady busy
             # node pooled with a quiet sibling is two steady nodes, not a burst.
-            # An empty matrix is not smoothed over with the legacy window
-            # average: it means no granular evidence came back, and the
-            # no-data paths below decide.
+            # The absolute peak threshold scales with the node's core count -
+            # it is hard to max out a large machine - and the curve's handoff
+            # point moves with it.  An empty matrix is not smoothed over with
+            # the legacy window average: it means no granular evidence came
+            # back, and the no-data paths below decide.
             per_node = evaluate_variance_by_node(
                 series,
                 peak_threshold=cfg.cpu_peak_threshold,
@@ -146,6 +150,12 @@ def check_cpu(
                 floor=CPU_VARIANCE_FLOOR,
                 baseline_full=cfg.cpu_peak_threshold / cfg.cpu_variance_ratio,
                 live_nodes=live_nodes,
+                baseline_mode="trough",
+                node_peak_thresholds=(
+                    {n: cpu_peak_threshold(c) for n, c in node_cores.items()}
+                    if node_cores
+                    else None
+                ),
             )
             if per_node:
                 stats = summarize_variance(per_node)
@@ -374,6 +384,7 @@ def check_gpu(cfg: Config, prom: PrometheusClient, gpu_nodes: list[GpuNode] | No
         ratio_threshold=cfg.gpu_variance_ratio,
         floor=GPU_VARIANCE_FLOOR,
         baseline_full=cfg.gpu_peak_threshold / cfg.gpu_variance_ratio,
+        baseline_mode="trough",
     )
 
     stats: VarianceStats | None = None

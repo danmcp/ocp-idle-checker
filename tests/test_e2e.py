@@ -260,7 +260,7 @@ def test_idle_cluster_verbose(monkeypatch, prom_server, tmp_path, capsys):
     ]
     assert (criteria["total"], criteria["met"], criteria["threshold"]) == (4, 4, 3)
     assert criteria["cpu"]["result"] == "IDLE"
-    assert criteria["cpu"]["threshold_ratio"] == 0.27
+    assert criteria["cpu"]["threshold_ratio"] == 0.24
     assert criteria["operators"]["age_days"] == 12.0
     assert criteria["operators"]["events"] == 0
     assert criteria["gpu"]["result"] == "N/A"
@@ -308,7 +308,7 @@ def test_active_cluster_quiet(monkeypatch, prom_server, tmp_path, capsys):
         "GPU: N/A",
         "Operators: ACTIVE",
         "Oversized: true (2 level-idle nodes)",
-        "STATUS: ACTIVE (CPU at 411% of threshold)",
+        "STATUS: ACTIVE (Operators at 350% of threshold)",
     ]
 
     report = json.loads(json_path.read_text())

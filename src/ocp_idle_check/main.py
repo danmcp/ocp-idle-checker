@@ -32,7 +32,13 @@ from .informational import (
     recent_activity_report,
 )
 from .log import GREEN, NC, RED, YELLOW, log_error, log_info, log_warn, set_verbose
-from .nodes import fmt2, gpu_nodes_from_items, instant_averages, worker_nodes_from_items
+from .nodes import (
+    fmt2,
+    gpu_nodes_from_items,
+    instant_averages,
+    node_cpu_cores,
+    worker_nodes_from_items,
+)
 from .oc import Oc
 from .oversized import evaluate_oversized
 from .prometheus import PrometheusClient
@@ -71,10 +77,12 @@ def run(argv: list[str] | None = None) -> int:
         # deleted nodes, the conservative direction.
         live_nodes = None
         gpu_nodes = None
+        node_cores = None
         log_warn("Node listing failed (oc error or timeout)")
     else:
         live_nodes = {str(item.get("metadata", {}).get("name", "")) for item in node_items}
         gpu_nodes = gpu_nodes_from_items(node_items)
+        node_cores = node_cpu_cores(node_items)
         log_info(f"Nodes: {len(live_nodes)} ({len(gpu_nodes)} with GPUs)")
     instant_cpu, instant_mem = instant_averages(oc.top_nodes())
 
@@ -88,7 +96,11 @@ def run(argv: list[str] | None = None) -> int:
     # exception re-raises at the same check it would have in that run.
     now = datetime.now(UTC)
     checks: list[tuple[str, str, Callable[[], CheckOutcome]]] = [
-        ("CPU Utilization", "CPU", lambda: check_cpu(cfg, prom, live_nodes, instant_cpu)),
+        (
+            "CPU Utilization",
+            "CPU",
+            lambda: check_cpu(cfg, prom, live_nodes, instant_cpu, node_cores),
+        ),
         ("Memory Utilization", "Memory", lambda: check_memory(cfg, prom, instant_mem, live_nodes)),
         ("API Server Activity", "API Server", lambda: check_api(cfg, prom)),
         ("GPU Utilization", "GPU", lambda: check_gpu(cfg, prom, gpu_nodes)),

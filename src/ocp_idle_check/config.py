@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import re
 from dataclasses import dataclass
 from pathlib import Path
@@ -25,12 +26,38 @@ ML_NODE_PATTERN = "p5|p4d|g5"
 
 # Variance rule defaults - fleet-calibration knobs, ideal values TBD.
 CPU_PEAK_THRESHOLD = 30.0  # percent; any 15-min window above this = ACTIVE
-CPU_VARIANCE_RATIO = 1.2  # burst multiple required at the handoff (peak threshold / ratio)
+CPU_VARIANCE_RATIO = 2.0  # burst multiple required at the handoff (peak threshold / ratio);
+# 2x because the baseline is now the trough, and a peak twice the workload's
+# floor is the least that reads as a burst rather than the same workload
 CPU_VARIANCE_FLOOR = 1.0  # percent; minimum peak the burst rule demands on a zero baseline
 GPU_PEAK_THRESHOLD = 40.0
-GPU_VARIANCE_RATIO = 1.2  # burst multiple required at the handoff (peak threshold / ratio)
+GPU_VARIANCE_RATIO = 2.0  # burst multiple required at the handoff (peak threshold / ratio)
 GPU_VARIANCE_FLOOR = 5.0  # percent; DCGM's idle noise tail reads 1-4% on a GPU doing nothing
 API_VARIANCE_RATIO = 1.2  # burst multiple required at the handoff (100 req/s / ratio = 83.3)
+
+# Core-scaled CPU peak threshold: it is hard to max out a large machine (a
+# steady 10% on 160 cores is 16 busy cores - a tenant, not noise), so the
+# absolute branch eases from 30% at 10 vCPUs to 8% at 100 vCPUs along a power
+# law and never goes below 8% - below that point only the variance (trough)
+# rule can accuse.  Unknown core counts keep the unscaled default.
+CPU_PEAK_THRESHOLD_LARGE = 8.0  # percent at CPU_PEAK_THRESHOLD_LARGE_VCPUS and above
+CPU_PEAK_THRESHOLD_LARGE_VCPUS = 100.0
+CPU_PEAK_THRESHOLD_SMALL_VCPUS = 10.0  # at this size and below, the full 30%
+
+_CPU_PEAK_EXPONENT = math.log(CPU_PEAK_THRESHOLD_LARGE / CPU_PEAK_THRESHOLD) / math.log(
+    CPU_PEAK_THRESHOLD_LARGE_VCPUS / CPU_PEAK_THRESHOLD_SMALL_VCPUS
+)
+
+
+def cpu_peak_threshold(cores: float | None) -> float:
+    """The CPU peak threshold for a node with `cores` vCPUs (see the
+    constants above); None or non-positive counts keep the default."""
+    if not cores or cores <= CPU_PEAK_THRESHOLD_SMALL_VCPUS:
+        return CPU_PEAK_THRESHOLD
+    if cores >= CPU_PEAK_THRESHOLD_LARGE_VCPUS:
+        return CPU_PEAK_THRESHOLD_LARGE
+    return CPU_PEAK_THRESHOLD * (cores / CPU_PEAK_THRESHOLD_SMALL_VCPUS) ** _CPU_PEAK_EXPONENT
+
 
 # Memory movement rule - see check_memory.  Absolute percentage points of
 # rise between window averages, not the shared ratio law: a fixed

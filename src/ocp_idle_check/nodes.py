@@ -46,6 +46,24 @@ def gpu_nodes_from_items(items: list[dict[str, Any]]) -> list[GpuNode]:
     return gpu_nodes
 
 
+def node_cpu_cores(items: list[dict[str, Any]]) -> dict[str, float]:
+    """Node name -> allocatable CPU cores, for the core-scaled peak
+    threshold.  Kubernetes reports cores as "64" or millicores "64000m";
+    unparsable values are skipped (the node then keeps the unscaled
+    default threshold)."""
+    cores: dict[str, float] = {}
+    for item in items:
+        name = str(item.get("metadata", {}).get("name", ""))
+        raw = str((item.get("status", {}).get("capacity", {}) or {}).get("cpu", ""))
+        if not name or not raw:
+            continue
+        try:
+            cores[name] = float(raw[:-1]) / 1000.0 if raw.endswith("m") else float(raw)
+        except ValueError:
+            continue
+    return cores
+
+
 # Role labels that mark a node as platform capacity rather than schedulable
 # worker capacity.  A quiet node with one of these is expected, not
 # right-sizing evidence: control-plane nodes cannot be removed, and infra

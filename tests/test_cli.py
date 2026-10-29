@@ -29,12 +29,27 @@ def test_defaults():
 def test_variance_rule_defaults():
     cfg = oic.parse_args([])
     assert cfg.cpu_peak_threshold == 30.0
-    assert cfg.cpu_variance_ratio == 1.2
+    assert cfg.cpu_variance_ratio == 2.0  # trough baseline: 2x is the least burst
     assert cfg.gpu_peak_threshold == 40.0
-    assert cfg.gpu_variance_ratio == 1.2
-    assert cfg.api_variance_ratio == 1.2
+    assert cfg.gpu_variance_ratio == 2.0
+    assert cfg.api_variance_ratio == 1.2  # API keeps the median baseline
     assert cfg.memory_variance_points == 10.0
     assert cfg.memory_variance_windows == 4
+
+
+def test_cpu_peak_threshold_scales_with_cores():
+    # Hard to max out a large machine: the absolute branch eases from 30%
+    # at 10 vCPUs to 8% at 100 along a power law, never below 8% - below
+    # that only the variance rule can accuse.
+    assert oic.cpu_peak_threshold(None) == 30.0
+    assert oic.cpu_peak_threshold(4) == 30.0
+    assert oic.cpu_peak_threshold(10) == 30.0
+    assert oic.cpu_peak_threshold(100) == 8.0
+    assert oic.cpu_peak_threshold(160) == 8.0
+    # On the curve between the anchors, monotone decreasing.
+    mid = oic.cpu_peak_threshold(32)
+    assert 8.0 < mid < 30.0
+    assert mid > oic.cpu_peak_threshold(64)
 
 
 def test_window_flag():

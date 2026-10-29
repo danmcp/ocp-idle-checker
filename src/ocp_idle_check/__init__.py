@@ -162,6 +162,7 @@ from .config import (
     VARIANCE_SOURCE,
     VARIANCE_WINDOW_MINUTES,
     Config,
+    cpu_peak_threshold,
     parse_args,
 )
 from .criteria import (
@@ -314,6 +315,7 @@ __all__ = [
     "cluster_short_name",
     "compute_verdict",
     "counted_unknowns",
+    "cpu_peak_threshold",
     "criteria_summary",
     "evaluate_memory_steps",
     "evaluate_memory_steps_by_node",

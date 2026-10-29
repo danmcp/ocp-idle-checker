@@ -22,7 +22,7 @@ class VarianceStats:
 
     points: int
     peak: float
-    baseline: float  # median of windows (query_range) or window mean (fallback)
+    baseline: float  # second-lowest window in trough mode, else median
     ratio: float | None  # peak / baseline; None when the baseline is zero
     required_ratio: (
         float | None
@@ -33,10 +33,27 @@ class VarianceStats:
     peak_exceeded: bool
     variance_exceeded: bool
     node: str = ""  # set by per-node evaluation; empty when not node-scoped
+    # The absolute peak threshold actually applied to this evaluation
+    # (per-node scaled for CPU); None when the rule has no absolute branch.
+    peak_threshold: float | None = None
 
     @property
     def active(self) -> bool:
         return self.peak_exceeded or self.variance_exceeded
+
+
+def _baseline(points: list[float], mode: str) -> float:
+    """The level the peak is measured against.
+
+    Trough mode (CPU, GPU): the second-lowest window, not the absolute
+    minimum - one dropped sample or monitoring gap must not become the
+    workload's floor.  Median mode (API): the classic median.
+    """
+    if mode != "trough":
+        return statistics.median(points)
+    if len(points) < 2:
+        return min(points)
+    return sorted(points)[1]
 
 
 def variance_curve_exponent(baseline_full: float, ratio_threshold: float) -> float:
@@ -92,14 +109,17 @@ def evaluate_variance(
     floor: float = 0.0,
     baseline_full: float = VARIANCE_DEFAULT_BASELINE_FULL,
     node: str = "",
+    baseline_mode: str = "median",
 ) -> VarianceStats:
     """The variance rule: ACTIVE when any window exceeded `peak_threshold`
     (when given), or when the peak clears the baseline-scaled required peak
-    (see variance_required_peak; `floor` is that requirement's minimum)."""
+    (see variance_required_peak; `floor` is that requirement's minimum).
+    `baseline_mode` picks what the peak is measured against - "trough" for
+    utilization series (CPU, GPU), "median" for the API server."""
     if not points:
         return VarianceStats(0, 0.0, 0.0, None, None, None, False, False)
     peak = max(points)
-    baseline = statistics.median(points)
+    baseline = _baseline(points, baseline_mode)
     required_peak = variance_required_peak(baseline, ratio_threshold, floor, baseline_full)
     ratio = peak / baseline if baseline > 0 else None
     required_ratio = required_peak / baseline if baseline > 0 else None
@@ -115,6 +135,7 @@ def evaluate_variance(
         peak_exceeded,
         variance_exceeded,
         node,
+        peak_threshold,
     )
 
 
@@ -126,19 +147,25 @@ def evaluate_variance_by_node(
     floor: float = 0.0,
     baseline_full: float = VARIANCE_DEFAULT_BASELINE_FULL,
     live_nodes: set[str] | None = None,
+    baseline_mode: str = "median",
+    node_peak_thresholds: dict[str, float] | None = None,
 ) -> list[VarianceStats]:
-    """Evaluate the variance rule once per node, each against its own median.
+    """Evaluate the variance rule once per node, each against its own
+    baseline (trough or median per `baseline_mode`).
 
-    Grouping matters because a pooled median is dragged by cross-node
+    Grouping matters because a pooled baseline is dragged by cross-node
     heterogeneity: a steady busy node pooled with a steady quiet sibling
-    lands the median in the valley between the two modes, and the busy
+    lands the baseline in the valley between the two modes, and the busy
     node's peak over that valley reads as a burst.  Judged per node, both
     are steady.  `live_nodes`, when given, drops series from nodes that no
     longer exist (their history is real but says nothing about the cluster
     as it stands); the GPU criterion deliberately omits it, since a deleted
-    node's samples are still activity.  Series with neither a `node` nor an
-    `instance` label share the empty node name and pool as one group.
-    Returns stats sorted by node name for deterministic output.
+    node's samples are still activity.  `node_peak_thresholds`, when given,
+    scales each node's absolute peak threshold (CPU: large machines rarely
+    max out their cores, so the percent bar eases with core count) and
+    moves the curve's handoff point with it.  Series with neither a `node`
+    nor an `instance` label share the empty node name and pool as one
+    group.  Returns stats sorted by node name for deterministic output.
     """
     if not series:
         return []
@@ -151,11 +178,20 @@ def evaluate_variance_by_node(
     return [
         evaluate_variance(
             points,
-            peak_threshold=peak_threshold,
+            peak_threshold=(
+                node_peak_thresholds.get(node, peak_threshold)
+                if node_peak_thresholds
+                else peak_threshold
+            ),
             ratio_threshold=ratio_threshold,
             floor=floor,
-            baseline_full=baseline_full,
+            baseline_full=(
+                node_peak_thresholds.get(node, peak_threshold) / ratio_threshold
+                if node_peak_thresholds
+                else baseline_full
+            ),
             node=node,
+            baseline_mode=baseline_mode,
         )
         for node, points in sorted(grouped.items())
         if points
@@ -238,15 +274,17 @@ def _threshold_ratio(value: float, threshold: float) -> float:
 
 def _variance_threshold_ratio(stats: VarianceStats, peak_threshold: float | None) -> float | None:
     """A variance evaluation's threshold ratio: the peak as a fraction of the
-    level that fires it - the absolute peak threshold (when the rule has one)
-    and the baseline-scaled required peak, whichever is closer.  None when
-    there is no data.  A floorless rule on a zero baseline (required peak 0)
-    fires on any positive peak, which no finite ratio expresses."""
+    level that fires it - the absolute peak threshold (when the rule has one;
+    the per-node scaled one when the stats carry it) and the baseline-scaled
+    required peak, whichever is closer.  None when there is no data.  A
+    floorless rule on a zero baseline (required peak 0) fires on any positive
+    peak, which no finite ratio expresses."""
     if stats.points == 0:
         return None
     heat: float = 0.0
-    if peak_threshold is not None:
-        heat = _threshold_ratio(stats.peak, peak_threshold)
+    applied = stats.peak_threshold if stats.peak_threshold is not None else peak_threshold
+    if applied is not None:
+        heat = _threshold_ratio(stats.peak, applied)
     required = stats.required_peak
     if required is None:
         return heat
