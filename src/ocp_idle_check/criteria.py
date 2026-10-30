@@ -233,7 +233,7 @@ def check_memory(
     baseline and the slow page-cache drift that pads every idle cluster's
     window average moves too gradually to clear the bar.  The instant
     reading no longer overrides an IDLE verdict: single-snapshot
-    deviations of 10+ points land on idle and active cluster nodes at the
+    deviations of 5+ points land on idle and active cluster nodes at the
     same rate, so the snapshot rides the report as information.  Only
     with no windowed data at all does the instant vote, in the bash
     direction - busy votes ACTIVE, quiet reads UNKNOWN - because one

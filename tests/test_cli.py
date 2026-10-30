@@ -33,7 +33,7 @@ def test_variance_rule_defaults():
     assert cfg.gpu_peak_threshold == 40.0
     assert cfg.gpu_variance_ratio == 2.0
     assert cfg.api_variance_ratio == 1.2  # API keeps the median baseline
-    assert cfg.memory_variance_points == 10.0
+    assert cfg.memory_variance_points == 5.0
     assert cfg.memory_variance_windows == 4
 
 

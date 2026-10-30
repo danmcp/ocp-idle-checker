@@ -34,7 +34,7 @@ Each criterion is evaluated independently and can be `IDLE`, `ACTIVE`, `UNKNOWN`
 | Criterion | Votes ACTIVE when |
 |-----------|-------------------|
 | **CPU** | any node's 15-minute window > the core-scaled peak threshold (30% at ≤ 10 vCPUs easing to 8% at ≥ 100, never below 8%; all 15-min windows from each node's total window (default: 7 days) are considered), or any node bursting well above its own trough (10× at a 0.2% trough, easing to 2× at 15%; 1% floor on a zero trough); an instant `oc adm top nodes` reading ≥ 15% can also flip an otherwise-IDLE result; with no windowed data at all, a busy instant votes ACTIVE but a quiet one reads UNKNOWN |
-| **Memory** | any live node's windowed memory rises more than 10 percentage points between two windows up to 4 consecutive 15-minute windows apart (2 windows are enough — the 4 is a max span, not a required count); with no windowed data at all, a busy instant votes ACTIVE but a quiet one reads UNKNOWN |
+| **Memory** | any live node's windowed memory rises more than 5 percentage points between two windows up to 4 consecutive 15-minute windows apart (2 windows are enough — the 4 is a max span, not a required count); with no windowed data at all, a busy instant votes ACTIVE but a quiet one reads UNKNOWN |
 | **API Server** | the time-windowed average ≥ 100 req/sec, or any 15-minute window bursting well above the median (10× at a 0.2 req/s median, easing to 1.2× at ~83.3 req/s) |
 | **GPU** | any node's 15-minute window > 40%, or any node bursting well above its own trough (DCGM GPU utilization; 5% floor on a zero trough) |
 | **Operators** | the median controller age is < 7 days, or ≥ 5 reconciliation events in the last 48 hours |
@@ -46,7 +46,7 @@ A criterion votes IDLE when none of its ACTIVE conditions hold. Some criteria ca
 | Check | Unit | Judged on | Absolute threshold | Variance threshold | Zero-baseline floor | No-data behavior |
 |---|---|---|---|---|---|---|
 | **CPU** | % per node | 15-min window averages from Prometheus | any window > 30% (`--cpu-peak-threshold`), scaled down by core count to as low as 8% | window peak > trough-scaled required peak (see table below) | 1% | busy instant (≥ 15%) votes ACTIVE; quiet instant reads UNKNOWN (counted) |
-| **Memory** | % per node | 15-min window averages | — (levels never vote) | rise > 10pp (`--memory-variance-points`) across 4 windows (`--memory-variance-windows`) | — | busy instant (≥ 35%) votes ACTIVE; quiet instant reads UNKNOWN (counted) |
+| **Memory** | % per node | 15-min window averages | — (levels never vote) | rise > 5pp (`--memory-variance-points`) across 4 windows (`--memory-variance-windows`) | — | busy instant (≥ 35%) votes ACTIVE; quiet instant reads UNKNOWN (counted) |
 | **GPU** | % per exporter | 15-min DCGM windows | any window > 40% (`--gpu-peak-threshold`) | same law as CPU (unscaled threshold) | 5% | no GPU nodes or no DCGM → N/A (not counted); failed node listing → UNKNOWN (counted) |
 | **API Server** | req/s cluster-wide | 15-min windows + whole-window average | windowed average ≥ 100 req/s (`--api-threshold`) | same law as CPU, floorless | none | both detectors dry → N/A (not counted) |
 | **Operators** | days / events | ReplicaSet ages, 48h reconciliation events | median age < 7 days (`--operator-age`) or ≥ 5 events (`--operator-event-hours` window) | — | — | no controllers found → N/A (not counted) |
@@ -92,7 +92,7 @@ The criterion votes on the **median** age across controllers, so one stale survi
 
 ### Memory Movement
 
-Memory is judged by movement, not level — memory that stays allocated keeps its level forever, so a high-baseline cluster sat over the old 35% level threshold permanently. The criterion reuses the CPU rule's per-node 15-minute windows and votes ACTIVE when any live node's windowed memory rose more than 10 percentage points (`--memory-variance-points`) across a sliding group of 4 consecutive windows (`--memory-variance-windows`) — roughly an hour. Something rising that fast only happens when something is actively allocating.
+Memory is judged by movement, not level — memory that stays allocated keeps its level forever, so a high-baseline cluster sat over the old 35% level threshold permanently. The criterion reuses the CPU rule's per-node 15-minute windows and votes ACTIVE when any live node's windowed memory rose more than 5 percentage points (`--memory-variance-points`) across a sliding group of 4 consecutive windows (`--memory-variance-windows`) — roughly an hour. Something rising that fast only happens when something is actively allocating.
 
 - **Rises are read at full strength.** The span always contains a fully-before and a fully-after window, so a jump landing mid-window cannot be diluted away.
 - **Drift stays excused.** Growth spread over more than the span (page cache and the like) reads as drift, not activity.
@@ -126,7 +126,7 @@ Every criterion exports a `threshold_ratio`: its hottest reading as a fraction o
 | Criterion | Hottest reading over |
 |---|---|
 | **CPU** | the hottest node's window peak over the peak threshold (30%) and over that node's own required peak; the instant reading over 15% |
-| **Memory** | the hottest node's rise over the movement threshold (10pp); the instant over 35% on the no-data path |
+| **Memory** | the hottest node's rise over the movement threshold (5pp); the instant over 35% on the no-data path |
 | **API Server** | the windowed average over 100 req/s; the variance peak over its baseline-scaled required peak |
 | **GPU** | the hottest node's window peak over the peak threshold (40%) and over that node's own required peak |
 | **Operators** | the event count over 5; the age threshold over the median controller age, inverted because younger is hotter — a 2-day median against the 7-day threshold reads 350% |
@@ -157,7 +157,7 @@ Edge cases: UNKNOWN and N/A criteria carry no ratio (`null`); the floorless zero
 | `-w, --window MINUTES` | Time window for averages | 10080 (7 days) |
 | `-c, --cpu-threshold N` | CPU idle threshold (%) — instant override and no-data instant vote | 15 |
 | `-m, --mem-threshold N` | Memory idle threshold (%) — no-data instant vote | 35 |
-| `--memory-variance-points N` | Memory: rise in percentage points between 15-min window averages that reads as activity | 10 |
+| `--memory-variance-points N` | Memory: rise in percentage points between 15-min window averages that reads as activity | 5 |
 | `--memory-variance-windows N` | Memory: consecutive 15-min windows a rise may span | 4 |
 | `-a, --api-threshold N` | API requests/sec threshold | 100 |
 | `-o, --operator-age N` | Operator age threshold (days) | 7 |

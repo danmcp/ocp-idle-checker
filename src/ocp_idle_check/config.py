@@ -63,7 +63,10 @@ def cpu_peak_threshold(cores: float | None) -> float:
 # rise between window averages, not the shared ratio law: a fixed
 # allocation is fixed points whatever the baseline, and a rise spread over
 # more than the window span reads as drift, not activity.
-MEMORY_VARIANCE_POINTS = 10.0  # points of rise within the span = ACTIVE
+# 5, not 10: the fleet's rises are flat drift noise bin-by-bin below 5
+# points and step up sharply at 10, and the 5-10 band is where the old
+# bash level rule was catching real allocations the movement rule missed.
+MEMORY_VARIANCE_POINTS = 5.0  # points of rise within the span = ACTIVE
 MEMORY_VARIANCE_WINDOWS = 4  # consecutive 15-min windows a rise may span (2 are needed at a min to perform the calculation)
 
 # The shared variance law, in each criterion's native unit: the required
