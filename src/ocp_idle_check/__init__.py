@@ -184,6 +184,7 @@ from .criteria import (
     format_threshold_ratio,
     parse_k8s_timestamp,
     threshold_focus,
+    utilization_veto,
     window_bounds,
 )
 from .informational import (
@@ -349,6 +350,7 @@ __all__ = [
     "summarize_memory_steps",
     "summarize_variance",
     "threshold_focus",
+    "utilization_veto",
     "variance_curve_exponent",
     "variance_required_peak",
     "window_bounds",

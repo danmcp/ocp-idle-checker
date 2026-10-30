@@ -75,6 +75,29 @@ def test_compute_verdict(outcomes, expected):
     assert oic.compute_verdict(outcomes) == expected
 
 
+# === UTILIZATION VETO =======================================================
+
+
+def test_utilization_veto_fires_only_without_node_data():
+    # The veto is scoped: a busy CPU or GPU criterion overrides the idle
+    # quorum only when the node listing failed - the state where the GPU lost
+    # its vote to the same failure and the criteria stopped being independent
+    # signals. With a healthy listing the quorum stands.
+    assert oic.utilization_veto(True, "ACTIVE", "N/A") is True
+    assert oic.utilization_veto(True, "N/A", "ACTIVE") is True
+    assert oic.utilization_veto(True, "ACTIVE", "ACTIVE") is True
+    assert oic.utilization_veto(False, "ACTIVE", "N/A") is False
+    assert oic.utilization_veto(False, "ACTIVE", "ACTIVE") is False
+
+
+def test_utilization_veto_quiet_criteria_never_fire():
+    # An idle or unknown utilization criterion gives the quorum nothing to
+    # veto, with or without the node listing.
+    assert oic.utilization_veto(True, "IDLE", "IDLE") is False
+    assert oic.utilization_veto(True, "UNKNOWN", "N/A") is False
+    assert oic.utilization_veto(False, "IDLE", "IDLE") is False
+
+
 # === COUNTED UNKNOWNS =======================================================
 
 

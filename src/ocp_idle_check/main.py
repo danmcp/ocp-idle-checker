@@ -24,6 +24,7 @@ from .criteria import (
     criteria_summary,
     format_threshold_ratio,
     threshold_focus,
+    utilization_veto,
 )
 from .informational import (
     gpu_machines_report,
@@ -156,6 +157,17 @@ def run(argv: list[str] | None = None) -> int:
         focus = None
     else:
         focus = threshold_focus(outcomes, status)
+        # Scoped utilization veto - see utilization_veto for the rationale.
+        if status == "IDLE" and utilization_veto(
+            node_items is None, cpu_outcome.result, gpu_outcome.result
+        ):
+            busy = "CPU" if cpu_outcome.result == "ACTIVE" else "GPU"
+            log_warn(
+                f"Node listing failed and the {busy} criterion is ACTIVE - "
+                "utilization veto overrides the idle quorum"
+            )
+            status, exit_code = "ACTIVE", 0
+            focus = None
     oversized = evaluate_oversized(
         status=status,
         quorum_driven=bool(focus and focus["quorum_driven"]),

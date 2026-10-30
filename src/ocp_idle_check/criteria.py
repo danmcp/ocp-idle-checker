@@ -672,6 +672,23 @@ def counted_unknowns(outcomes: list[CheckOutcome]) -> list[str]:
     ]
 
 
+def utilization_veto(node_listing_failed: bool, cpu_result: str, gpu_result: str) -> bool:
+    """The scoped utilization veto: when the node listing failed, an ACTIVE
+    CPU or GPU criterion cannot be outvoted by the idle quorum.
+
+    A failed listing does not merely cost the GPU its vote (N/A shrinks the
+    denominator) - it breaks the quorum's premise that the criteria are
+    independent signals, since they all degrade together through the same
+    unreadable cluster.  In that state sustained utilization is disqualifying
+    no matter how quiet memory, the API server, and the operators are.  With
+    a healthy node listing the quorum stands unchanged: a single busy
+    criterion can still be outvoted there (run 40 of the fleet produced 16
+    IDLE verdicts with an ACTIVE CPU criterion, all with empty node
+    inventories; a full-inventory replay kept two of those IDLE by design).
+    """
+    return node_listing_failed and "ACTIVE" in (cpu_result, gpu_result)
+
+
 def threshold_focus(outcomes: list[CheckOutcome], status: str) -> dict[str, Any] | None:
     """The criterion sitting at the verdict's boundary, as a threshold ratio:
     for an IDLE verdict the hottest IDLE vote - the one whose flip would eat
